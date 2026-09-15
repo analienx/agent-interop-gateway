@@ -93,9 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     health = sub.add_parser("health", help="check a gateway")
     health.add_argument("--url", default="http://127.0.0.1:8765")
     health.set_defaults(
-        func=lambda args: print(
-            json.dumps(_request(args.url.rstrip("/") + "/health"), indent=2)
-        )
+        func=lambda args: print(json.dumps(_request(args.url.rstrip("/") + "/health"), indent=2))
     )
     return parser
 

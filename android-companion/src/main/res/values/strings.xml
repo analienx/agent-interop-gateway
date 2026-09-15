@@ -1,0 +1,4 @@
+﻿<resources>
+    <string name="app_name">AIGW Bridge</string>
+    <string name="accessibility_description">Observes explicit local-delegation phrases in ChatGPT and relays only those tasks to your configured Agent Interop Gateway. It does not capture video or screenshots.</string>
+</resources>

@@ -24,15 +24,19 @@ def route(request: DelegationRequest, executors: list[Executor]) -> list[Executo
 
     preference = request.routing.preference
     if preference == RoutingPreference.LOWEST_COST:
+
         def key(x):
             return (x.config.cost_tier, -x.config.quality_tier, x.config.priority)
     elif preference == RoutingPreference.QUALITY_FIRST:
+
         def key(x):
             return (-x.config.quality_tier, x.config.cost_tier, x.config.priority)
     elif preference == RoutingPreference.SPECIFIC:
+
         def key(x):
             return x.config.priority
     else:
+
         def key(x):
             return (x.config.priority, x.config.cost_tier, -x.config.quality_tier)
 
