@@ -1,0 +1,50 @@
+[gateway]
+host = "127.0.0.1"
+port = 8765
+allow_write = false
+allow_privileged = false
+max_output_chars = 50000
+
+# `priority` is operator-defined routing order for local_first (lower wins).
+# `cost_tier`: 0=free/local, 1=session/pass, 2=metered/paid (convention only).
+# `quality_tier`: larger means preferred for quality_first.
+
+[[executors]]
+name = "pi"
+type = "agent_process"
+argv = ["pi", "--print"]
+capabilities = ["fs.read", "fs.write", "shell", "git"]
+cost_tier = 1
+quality_tier = 3
+priority = 20
+enabled = false
+
+[[executors]]
+name = "local-agent"
+type = "agent_process"
+argv = ["my-local-agent", "--stdin"]
+capabilities = ["fs.read", "fs.write", "shell"]
+cost_tier = 0
+quality_tier = 2
+priority = 10
+enabled = false
+
+[[executors]]
+name = "safe-process"
+type = "structured_process"
+capabilities = ["process"]
+allowed_commands = ["git"]
+allowed_env = []
+cost_tier = 0
+quality_tier = 0
+priority = 100
+enabled = false
+
+[[executors]]
+name = "echo"
+type = "echo"
+capabilities = ["demo"]
+cost_tier = 0
+quality_tier = 0
+priority = 1000
+enabled = true
