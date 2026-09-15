@@ -75,7 +75,7 @@ class DelegationResult(BaseModel):
     error: str | None = None
 
     @classmethod
-    def queued(cls, request_id: str) -> "DelegationResult":
+    def queued(cls, request_id: str) -> DelegationResult:
         return cls(delegation_id=request_id, state=DelegationState.QUEUED)
 
     def mark_started(self, executor: str) -> None:

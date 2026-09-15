@@ -24,12 +24,16 @@ def route(request: DelegationRequest, executors: list[Executor]) -> list[Executo
 
     preference = request.routing.preference
     if preference == RoutingPreference.LOWEST_COST:
-        key = lambda x: (x.config.cost_tier, -x.config.quality_tier, x.config.priority)
+        def key(x):
+            return (x.config.cost_tier, -x.config.quality_tier, x.config.priority)
     elif preference == RoutingPreference.QUALITY_FIRST:
-        key = lambda x: (-x.config.quality_tier, x.config.cost_tier, x.config.priority)
+        def key(x):
+            return (-x.config.quality_tier, x.config.cost_tier, x.config.priority)
     elif preference == RoutingPreference.SPECIFIC:
-        key = lambda x: x.config.priority
+        def key(x):
+            return x.config.priority
     else:
-        key = lambda x: (x.config.priority, x.config.cost_tier, -x.config.quality_tier)
+        def key(x):
+            return (x.config.priority, x.config.cost_tier, -x.config.quality_tier)
 
     return sorted(candidates, key=key)
