@@ -1,0 +1,91 @@
+name: Android CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+      - name: Android lint
+        run: gradle --no-daemon :android-companion:lintDebug
+      - name: JVM unit tests
+        run: gradle --no-daemon :android-companion:testDebugUnitTest
+      - name: Build debug APK
+        run: gradle --no-daemon :android-companion:assembleDebug
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: aigw-bridge-debug
+          path: android-companion/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  emulator-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Enable KVM access
+        run: |
+          sudo chown root:kvm /dev/kvm
+          sudo chmod 660 /dev/kvm
+      - name: Install emulator image
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" \
+            "emulator" "system-images;android-35;google_apis;x86_64"
+      - name: Create AVD
+        run: |
+          echo no | avdmanager create avd --force --name aigw-ci \
+            --package "system-images;android-35;google_apis;x86_64"
+      - name: Boot emulator
+        run: |
+          nohup emulator -avd aigw-ci -no-window -no-audio -no-boot-anim \
+            -no-snapshot -gpu swiftshader_indirect -accel on >emulator.log 2>&1 &
+          adb wait-for-device
+          timeout 180 bash -c 'until [[ "$(adb shell getprop sys.boot_completed | tr -d "\r")" == "1" ]]; do sleep 2; done'
+          adb shell input keyevent 82
+      - name: Instrumented mobile tests
+        run: gradle --no-daemon :android-companion:connectedDebugAndroidTest
+      - name: Capture emulator diagnostics on failure
+        if: failure()
+        run: |
+          adb logcat -d > android-logcat.txt || true
+          adb shell dumpsys activity activities > android-activity.txt || true
+          tail -200 emulator.log || true
+      - name: Upload emulator diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-emulator-diagnostics
+          path: |
+            android-logcat.txt
+            android-activity.txt
+            emulator.log
