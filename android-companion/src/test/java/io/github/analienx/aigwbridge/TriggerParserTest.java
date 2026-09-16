@@ -1,4 +1,4 @@
-﻿package io.github.analienx.aigwbridge;
+package io.github.analienx.aigwbridge;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;

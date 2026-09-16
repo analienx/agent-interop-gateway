@@ -1,4 +1,4 @@
-﻿package io.github.analienx.aigwbridge;
+package io.github.analienx.aigwbridge;
 
 import android.content.Context;
 import android.content.SharedPreferences;

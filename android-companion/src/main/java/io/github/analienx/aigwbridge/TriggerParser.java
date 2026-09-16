@@ -1,4 +1,4 @@
-﻿package io.github.analienx.aigwbridge;
+package io.github.analienx.aigwbridge;
 
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
