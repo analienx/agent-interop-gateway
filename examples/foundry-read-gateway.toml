@@ -1,0 +1,26 @@
+# Read-only AIGW -> Pi -> Foundry MCP reference executor.
+# Run the gateway from the repository root, or replace cwd with an absolute clone path.
+
+[gateway]
+host = "127.0.0.1"
+port = 8765
+allow_write = false
+allow_privileged = false
+max_concurrent_delegations = 2
+max_queued_delegations = 16
+
+[[executors]]
+name = "foundry-pi-read"
+type = "agent_process"
+argv = [
+  "pwsh", "-NoProfile", "-NonInteractive", "-File",
+  "scripts/foundry/run-read-agent.ps1"
+]
+cwd = "."
+capabilities = ["fs.read", "git", "foundry.read"]
+allowed_risks = ["read"]
+priority = 1
+cost_tier = 0
+quality_tier = 3
+max_parallel = 1
+max_attempts = 1

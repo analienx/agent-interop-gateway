@@ -1,66 +1,47 @@
-# ChatGPT Android voice interoperability experiment
+# ChatGPT Android Live voice interoperability experiment
 
 ## Objective
 
-Keep the normal ChatGPT voice conversation as the human interface while delegating selected machine work to a local gateway, without turning the entire session into a screenshot-driven computer-use loop.
+Keep the ordinary ChatGPT Live conversation as the human interface while delegating selected machine work to AIGW, without converting the session into continuous screen takeover.
 
-## What must be measured
+This document describes an **experiment**, not an official ChatGPT extension API. AIGW does not use or reverse-engineer private ChatGPT network endpoints.
 
-1. **Transcript observability** — while ChatGPT is active, does Android's UI hierarchy expose enough conversation/transcript text to identify a newly spoken request?
-2. **Composer availability** — while voice is active, is an editable message field present in the same UI hierarchy?
-3. **Concurrent result injection** — if the bridge inserts a text result into that conversation, does the active voice session consume/respond to it without being restarted?
-4. **State cost** — can semantic polling be slowed or event-driven enough to remain substantially cheaper than screen capture?
+## What must be proven on a real device
 
-The repository includes `probe`, `snapshot`, `watch` and `inject` specifically to answer these questions on real devices instead of assuming a changing application UI.
+1. **Transcript observability** — a newly spoken user turn becomes visible in Android semantic accessibility state.
+2. **Freshness** — the bridge can avoid interpreting old visible transcript history as a new request.
+3. **Composer availability** — a supported editable control is available when a local result is ready.
+4. **Concurrent result delivery** — injected result text reaches the same active conversation without restarting Live voice.
+5. **Confirmation** — the bridge can verify one delivery and avoid duplicate injection.
+6. **Latency/cost** — semantic event processing remains materially cheaper than continuous screenshot/video control.
 
-## Proposed flow if validation succeeds
+## Safe test sequence
 
-```text
-User speaks naturally to ChatGPT
-        |
-        v
-ChatGPT UI exposes transcript text
-        |
-        v
-ADB bridge observes NEW semantic text
-        |
-        +--> local classifier: machine delegation needed?
-                  |
-                  v yes
-             POST AIGW/1
-                  |
-                  v
-            gateway routes executor
-                  |
-                  v
-              normalized result
-                  |
-                  v
-bridge injects [local delegation result] into same conversation
-                  |
-                  v
-ChatGPT incorporates result and continues voice conversation
-```
+Start read-only and tethered. Configure the companion for `fs.read`, keep write mode disabled, use a fresh bearer token, and connect through `adb reverse tcp:8765 tcp:8765`.
 
-No fixed wake word is architecturally required. A local classifier or an explicit machine-action phrase can trigger delegation. v0.1 uses only conservative heuristics and requires `--arm` for execution.
+First validate `aigw-chatgpt-android probe` and `watch`. Then enable the native companion and use an explicit harmless phrase such as `delegate locally report the current repository branch`.
+Record Android version, ChatGPT app version, whether Live voice is active, semantic probe output with private content removed, delegation detection latency, gateway execution latency, and whether the result marker becomes visible after one send.
 
-## Fallbacks
+## Acceptance criteria
 
-If Live voice does not expose a composer, the bridge must not blindly navigate the UI. Record the probe and test another transport: a synchronized web session, an Android companion/overlay, a future platform-native assistant API, or an explicit one-action UI transition chosen by the user.
+The experiment is successful only if:
 
-If concurrent insertion is ignored by Live voice, the model-agnostic gateway remains useful; only the ChatGPT-specific bridge needs replacement.
+- normal detection uses semantic events/tree state, not continuous screenshots;
+- service startup does not execute old transcript content;
+- an explicit fresh delegation executes exactly once across reconnect/restart tests;
+- the returned result reaches the same conversation with no more than one deliberate UI transition;
+- an unconfirmed send becomes `injection_uncertain` and is not automatically repeated;
+- killing/restarting gateway or companion does not duplicate a state-changing delegation;
+- disabling the companion immediately stops delegation behavior.
 
-## Non-goals
+## GitHub CI versus real-device validation
 
-- Reverse-engineering private ChatGPT network APIs.
-- Circumventing authentication, subscriptions, quotas or platform controls.
-- Continuous screen recording.
-- Misrepresenting a general automation service as an accessibility aid.
+GitHub Actions can compile/lint the Android app and run instrumentation tests on a hardware-accelerated emulator. That exercises Android Keystore, the companion ledger, parsing, configuration, and framework integration.
 
-## First real-device milestone
+It cannot reproduce a production signed-in ChatGPT Live session. A green emulator job therefore means **the bridge implementation runs on Android**, not **ChatGPT Live compatibility is proven**.
 
-- `probe` works on the target Android build and current ChatGPT app.
-- A spoken user turn appears in semantic UI text soon after transcript availability.
-- No screenshot is needed for normal detection.
-- A delegation result can return to the active conversation with at most one UI transition.
-- Gateway execution remains independent of whichever LLM handled the conversation.
+## Failure policy
+
+If transcript or composer semantics are unavailable, do not compensate with continuous screen recording. Candidate alternatives are a first-party provider tool interface when available, a synchronized web/session transport, an OS-level assistant interoperability API, or an explicit user-triggered one-action transition.
+
+The gateway/executor architecture remains valid even if the ChatGPT-specific bridge changes; provider-specific behavior is intentionally isolated at the edge.
