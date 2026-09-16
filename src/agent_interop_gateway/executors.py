@@ -345,7 +345,7 @@ async def _run_process(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                creationflags=int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)),
             )
         else:
             process = await asyncio.create_subprocess_exec(
@@ -415,7 +415,10 @@ async def _terminate_tree(process: asyncio.subprocess.Process, grace_seconds: fl
             process.terminate()
     else:
         try:
-            os.killpg(process.pid, signal.SIGTERM)  # type: ignore[attr-defined]
+            killpg = getattr(os, "killpg", None)
+            if killpg is None:
+                raise OSError("process-group termination is unavailable")
+            killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             return
 
@@ -441,7 +444,9 @@ async def _terminate_tree(process: asyncio.subprocess.Process, grace_seconds: fl
             process.kill()
     else:
         with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+            killpg = getattr(os, "killpg", None)
+            if killpg is not None:
+                killpg(process.pid, getattr(signal, "SIGKILL", 9))
     await process.wait()
 
 
