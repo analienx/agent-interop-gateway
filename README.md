@@ -8,7 +8,14 @@ The goal is simple: a conversation should be able to hand work to a computer you
 
 ## What is implemented
 
-- Neutral `aigw/1` delegation protocol.
+- Neutral `aigw/1` delegation protocol (deprecated; returns `Deprecation: true`).
+- Typed `foundry/v3` adapter: forwards explicit Foundry
+  prepare/attach/execute/status/cancel/read-result/quarantine with
+  idempotency keys, request hashes, policy results, attempt ids, and states,
+  plus cursor/paginated bulk reads for projects, jobs, attempts, activity,
+  artifacts, approvals, health, and evidence. The gateway never selects
+  models, accounts, or cost tiers (Cline Model Optimizer owns routing) and
+exposes no general shell/filesystem mutation as a v3 tool.
 - FastAPI local gateway with bearer-token authentication.
 - Capability-based routing with `local_first`, `lowest_cost`, `quality_first`, or explicit executor selection.
 - Pluggable executor adapters:

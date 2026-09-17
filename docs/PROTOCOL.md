@@ -1,4 +1,10 @@
-# AIGW/1 protocol
+# AIGW/1 protocol (deprecated) + Foundry v3 adapter contract
+
+> `aigw/1` is **deprecated**. It remains mounted for the Android
+> read/relay experiment and returns `Deprecation: true` on every response.
+> New integrations must use the typed `foundry/v3` endpoints below.
+
+## Foundry v3 (`foundry/v3`, current)
 
 `aigw/1` is a small JSON contract between a conversational surface/bridge and a user-controlled gateway.
 
@@ -57,3 +63,41 @@ Cost and quality are relative integers rather than vendor/model names, keeping t
 ## Authentication
 
 If `AIGW_TOKEN` or `[gateway].token` is configured, protected routes require `Authorization: Bearer <token>`. The health endpoint remains unauthenticated so local supervisors can check liveness without receiving execution privileges.
+
+All `/v3/*` routes require the same bearer token as `/v1/*`.
+
+## Foundry v3 typed operations
+
+The gateway is an authenticated transport/translation adapter, not a
+scheduler or model router. It forwards explicit Foundry operations and
+returns idempotency keys, request hashes, policy results, attempt ids, and
+states on every write:
+
+| Operation | Endpoint |
+| --- | --- |
+| prepare | `POST /v3/jobs:prepare` |
+| attach artifact | `POST /v3/jobs/{id}:attach` |
+| execute | `POST /v3/jobs/{id}:execute` |
+| status (cursor) | `GET /v3/jobs/{id}/status?after_cursor=N` |
+| cancel | `POST /v3/jobs/{id}:cancel` |
+| read result | `GET /v3/jobs/{id}/result` |
+| quarantine | `POST /v3/jobs/{id}:quarantine` |
+
+Every mutating call requires an `idempotency_key`. Replays return the stored
+response with `replayed: true`; reusing a key with a different payload is a
+`409` conflict. Mutations carry `expected_generation` fencing; stale
+callers get `409`. Terminal states are immutable; cancelling an `accepted`
+job is rejected (`409`) because the Foundry machine has no
+`accepted -> cancel_requested` edge. `read_result` before a terminal state
+is a `409`, never a guess.
+
+Cursor/paginated bulk reads (all `GET /v3/{resource}?limit=&cursor=`):
+`projects`, `jobs`, `attempts`, `activity`, `artifacts`, `approvals`,
+`health`, `evidence`. No general shell or filesystem mutation exists on the
+v3 path by design.
+
+Model, cost-tier, and account selection fields are rejected (`422`) on the
+v3 path. Model and account routing is owned exclusively by Cline Model
+Optimizer.
+
+## AIGW/1 request (deprecated)
