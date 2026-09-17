@@ -73,8 +73,13 @@ jobs:
             "emulator" "system-images;android-35;google_apis;x86_64"
       - name: Create AVD
         run: |
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/android-avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
           echo no | avdmanager create avd --force --name aigw-ci \
             --package "system-images;android-35;google_apis;x86_64"
+          avdmanager list avd
+          test -f "$ANDROID_AVD_HOME/aigw-ci.ini"
       - name: Boot emulator
         timeout-minutes: 8
         run: |
