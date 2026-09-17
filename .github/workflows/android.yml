@@ -74,7 +74,10 @@ jobs:
       - name: Boot emulator
         timeout-minutes: 8
         run: |
-          nohup emulator -avd aigw-ci -no-window -no-audio -no-boot-anim \
+          EMULATOR="$ANDROID_SDK_ROOT/emulator/emulator"
+          test -x "$EMULATOR"
+          "$EMULATOR" -version
+          nohup "$EMULATOR" -avd aigw-ci -no-window -no-audio -no-boot-anim \
             -no-snapshot -gpu swiftshader_indirect -accel on >emulator.log 2>&1 &
           if ! timeout 90 adb wait-for-device; then
             echo "ERROR: emulator never registered with ADB within 90s"
