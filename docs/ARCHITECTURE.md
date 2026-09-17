@@ -36,6 +36,17 @@ This document describes the runtime architecture of Agent Interop Gateway (AIGW)
 ```
 
 The key architectural property is that the **conversation surface is not the execution plane**. It may request work and consume normalized results without maintaining a live graphical control loop.
+
+AIGW further separates the execution plane into three concerns:
+
+```text
+policy plane       risk + capability admission + routing
+reasoning plane    optional natural-language planner
+authority plane    MCP/API/typed command that can actually observe or mutate state
+```
+
+A model belongs to the reasoning plane. It does not become an authority boundary merely because it can produce tool calls.
+
 ## Components
 
 ### Conversation surface
@@ -74,6 +85,10 @@ Read-only completed entries expire according to `result_ttl_seconds`. State-chan
 ### Router and executors
 
 The router filters by declared capabilities and executor `allowed_risks`, then orders candidates by the requested policy. Executors perform the actual work and report normalized attempts/results.
+
+For read-oriented agentic work, `constrained_agent` is the preferred executor contract. It is validation-enforced read-only, declares a `transport` and operator-defined `profile`, and requires a downstream `probe_argv`. The probe must demonstrate that the real authority plane is reachable; finding the launcher executable is not enough.
+
+Generic `agent_process` remains available for integrations that do not need this stronger contract. `structured_process` is the state-capable path and accepts explicit argv rather than interpreting natural language as shell syntax.
 ## Execution and durability flow
 
 ```text
@@ -103,7 +118,7 @@ network transport                     executor allowlists
                                       OS account permissions
 ```
 
-A natural-language task is data, not shell syntax. `agent_process` writes it to stdin. `structured_process` accepts argv only under command, cwd, environment, capability, and risk allowlists.
+A natural-language task is data, not shell syntax. `agent_process` and `constrained_agent` write it to stdin. `structured_process` accepts argv only under command, cwd, environment, capability, and risk allowlists.
 
 The bearer token authenticates the bridge to the gateway; it does not elevate an executor beyond its configured policy or OS permissions.
 
@@ -137,7 +152,7 @@ ChatGPT Android text/voice
   -> AccessibilityService bridge
   -> AIGW /v1/delegations
   -> read-risk/capability policy
-  -> agent_process: foundry-pi-read
+  -> constrained_agent: foundry-pi-read
   -> Pi with built-in machine tools disabled
   -> explicit Foundry read-tool allowlist
   -> MCP stdio
@@ -148,17 +163,19 @@ The Android bridge owns **conversation detection and result return**. AIGW owns 
 
 Remote-desktop control is intentionally outside this normal path. A deployment may retain it as a separate GUI/recovery capability, but ordinary repository inspection should not pay the cost or fragility of a screen-driving loop.
 
-The reference adapter has three independent constraints: AIGW only routes `risk=read` to the executor; Pi has no built-in shell/filesystem tools active; and the MCP client refuses tool names outside its explicit Foundry read allowlist. See `FOUNDRY_MCP.md`.
+The reference adapter has four independent constraints: AIGW structurally validates the executor as read-only; Pi has no built-in shell/filesystem tools active; the MCP client refuses tool names outside its explicit Foundry read allowlist; and the executor readiness probe performs a real `foundry_status` MCP call before the profile is considered healthy. See `FOUNDRY_MCP.md` and `EXECUTION_MODEL.md`.
+
+Successful constrained-agent results also carry non-authoritative execution provenance (`kind`, `transport`, `profile`, declared capabilities). This lets operators verify which boundary handled a request without making result metadata part of the permission decision.
 
 ## Deployment shapes
 
 ### Single-machine development
 
-`bridge -> http://127.0.0.1:8765 -> gateway -> local executor`. This is the default and smallest trust surface.
+`bridge -> http://127.0.0.1:<port> -> gateway -> local executor`. Port `8765` is the generic default. Loopback-only is the smallest trust surface.
 
 ### Tethered Android development
 
-`Android companion -> 127.0.0.1:8765 -> adb reverse -> host gateway`. The phone sees loopback and the bearer token never needs to traverse the LAN.
+`Android companion -> 127.0.0.1:<port> -> adb reverse -> host gateway`. The phone sees loopback and the bearer token never needs to traverse the LAN. The current Foundry reference deployment uses port `8785`.
 
 ### Untethered mobile
 
@@ -167,6 +184,12 @@ Use HTTPS through a private VPN/overlay network or an authenticated reverse prox
 ### Multiple gateway processes
 
 Processes may share the same SQLite journal on one host. Cross-process claims prevent duplicate work. SQLite is intentionally not presented as a distributed multi-host consensus database; multi-host deployments should use one authoritative gateway/journal or a future distributed backend.
+
+## Readiness and operator control
+
+`/health` proves only that the gateway process is alive. `/ready` evaluates the durable journal and each enabled executor probe. Executor readiness includes type, capabilities, risks, transport, profile, routing tiers, and a failure reason when unavailable.
+
+`aigw doctor` runs the same execution-plane checks without starting the web server. This is the preferred preflight before an Android or voice acceptance test because it distinguishes gateway configuration failures from conversation-surface compatibility failures.
 
 ## Extension points
 

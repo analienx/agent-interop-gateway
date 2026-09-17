@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import secrets
@@ -42,6 +43,22 @@ def _serve(args: argparse.Namespace) -> None:
     )
 
 
+def _doctor(args: argparse.Namespace) -> None:
+    from .service import GatewayService
+
+    config = load_config(args.config)
+    service = GatewayService(config)
+
+    async def run() -> dict[str, object]:
+        await service.start()
+        return await service.readiness()
+
+    readiness = asyncio.run(run())
+    print(json.dumps(readiness, indent=2, ensure_ascii=False))
+    if not readiness["ready"]:
+        raise SystemExit(1)
+
+
 def _submit(args: argparse.Namespace) -> None:
     base = args.url.rstrip("/")
     body = {
@@ -70,6 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
     serve.set_defaults(func=_serve)
+
+    doctor = sub.add_parser("doctor", help="validate config and probe the execution plane")
+    doctor.add_argument("--config")
+    doctor.set_defaults(func=_doctor)
 
     submit = sub.add_parser("submit", help="submit a delegation")
     submit.add_argument("task")

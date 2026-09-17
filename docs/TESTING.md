@@ -10,7 +10,9 @@ Android CI covers lint, JVM tests, APK assembly, and emulator instrumentation. E
 
 ## Local integration
 
-A local gateway smoke test should submit a real `risk=read` request through the configured executor and verify a committed successful result. The Foundry reference path additionally verifies the MCP read plane independently before testing the reasoning agent.
+Run `aigw doctor --config <profile>` first. It must prove configuration validity, durable journal health, and the real downstream executor probe. A local gateway smoke test should then submit a real `risk=read` request through the configured executor and verify a committed successful result plus expected execution provenance.
+
+The Foundry reference probe calls `foundry_status` through MCP before the reasoning agent is involved. This cleanly separates authority-plane failures from model/provider failures and from Android compatibility failures.
 
 ## Physical Android acceptance
 

@@ -95,7 +95,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Agent Interop Gateway",
-        version="0.1.1",
+        version="0.2.0-alpha.1",
         lifespan=lifespan,
         docs_url="/docs",
         redoc_url=None,
@@ -136,7 +136,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, object]:
-        return {"status": "ok", "protocol": "aigw/1", "version": "0.1.1"}
+        return {"status": "ok", "protocol": "aigw/1", "version": "0.2.0-alpha.1"}
 
     @app.get("/ready", dependencies=[Depends(authorize)])
     async def ready(request: Request) -> dict[str, object]:

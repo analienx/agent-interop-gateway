@@ -17,12 +17,15 @@ The default configuration path is `~/.agent-interop-gateway/gateway.toml`. The d
 
 ## Start and verify
 
+Run the execution-plane preflight before exposing a bridge:
+
 ```bash
+aigw doctor --config ~/.agent-interop-gateway/gateway.toml
 aigw serve
 aigw health
 ```
 
-`GET /health` checks process liveness. `GET /ready` checks enabled executor probes and the SQLite journal; use readiness rather than liveness for a supervisor/load balancer decision.
+`aigw doctor` validates configuration, initializes the durable journal, and runs each enabled executor's real readiness probe. `GET /health` checks process liveness. `GET /ready` repeats executor/journal readiness through the running service; use readiness rather than liveness for a supervisor/load balancer decision.
 
 ## Environment overrides
 
@@ -52,8 +55,8 @@ Never enable write mode just to test whether the bridge can see transcript text.
 1. Stop new delegation admission or wait for current work to finish.
 2. Back up the configuration and state database.
 3. Upgrade the package/repository.
-4. Run `aigw health` and authenticated `/ready`.
-5. Submit a deterministic read-only smoke delegation with a fresh ID.
+4. Run `aigw doctor`, then `aigw health` and authenticated `/ready`.
+5. Submit a deterministic read-only smoke delegation with a fresh ID and verify expected execution provenance.
 6. Only then re-enable external bridges or write policy.
 
 ## Incident handling
@@ -66,4 +69,4 @@ If an executor becomes unhealthy, `/ready` reports its probe reason. Disable it 
 
 ## Observability
 
-Current v0.1.1 observability is intentionally compact: structured HTTP status, request IDs, readiness detail, normalized attempt history, executor stdout/stderr bounds, and durable result state. Metrics/tracing exporters are a later extension point; they must not leak conversation content or secrets by default.
+Current v0.2.0-alpha.1 observability is intentionally compact: structured HTTP status, request IDs, readiness detail, normalized attempt history, executor stdout/stderr bounds, and durable result state. Metrics/tracing exporters are a later extension point; they must not leak conversation content or secrets by default.

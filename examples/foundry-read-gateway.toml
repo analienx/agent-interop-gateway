@@ -11,12 +11,19 @@ max_queued_delegations = 16
 
 [[executors]]
 name = "foundry-pi-read"
-type = "agent_process"
+type = "constrained_agent"
 argv = [
   "pwsh", "-NoProfile", "-NonInteractive", "-File",
   "scripts/foundry/run-read-agent.ps1"
 ]
 cwd = "."
+transport = "local_mcp"
+profile = "foundry-read-v1"
+probe_argv = [
+  "pwsh", "-NoProfile", "-NonInteractive", "-File",
+  "scripts/foundry/probe-read-agent.ps1"
+]
+probe_timeout_seconds = 20
 capabilities = ["fs.read", "git", "foundry.read"]
 allowed_risks = ["read"]
 priority = 1

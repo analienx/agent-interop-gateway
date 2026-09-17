@@ -58,6 +58,18 @@ class Executor:
             and required.issubset(self.capabilities)
         )
 
+    def descriptor(self) -> dict[str, object]:
+        return {
+            "type": self.config.type,
+            "capabilities": sorted(self.config.capabilities),
+            "allowed_risks": sorted(self.config.allowed_risks),
+            "transport": self.config.transport,
+            "profile": self.config.profile,
+            "cost_tier": self.config.cost_tier,
+            "quality_tier": self.config.quality_tier,
+            "priority": self.config.priority,
+        }
+
     def _truncate(self, value: str) -> str:
         limit = self.gateway_config.max_output_chars
         if len(value) <= limit:
@@ -219,6 +231,47 @@ class AgentProcessExecutor(ProcessExecutor):
                 env=self._environment(),
                 stdin_text=request.task,
             )
+
+
+class ConstrainedAgentExecutor(AgentProcessExecutor):
+    """Natural-language agent with an explicit machine-tool boundary and readiness probe."""
+
+    async def probe(self) -> tuple[bool, str | None]:
+        ok, reason = await super().probe()
+        if not ok:
+            return ok, reason
+        if not self.config.probe_argv:
+            return False, "probe_argv is empty"
+        outcome = await _run_process(
+            self.config.probe_argv,
+            cwd=self.config.cwd,
+            env=self._environment(),
+            stdin_text=None,
+            timeout=self.config.probe_timeout_seconds,
+            output_char_limit=min(self.gateway_config.max_output_chars, 8_000),
+            kill_grace_seconds=self.config.kill_grace_seconds,
+        )
+        if outcome.timed_out:
+            return False, f"readiness probe timed out after {self.config.probe_timeout_seconds}s"
+        if outcome.returncode != 0:
+            detail = (outcome.stderr or outcome.stdout).strip()
+            detail = detail[:512] if detail else f"exit code {outcome.returncode}"
+            return False, f"readiness probe failed: {detail}"
+        return True, None
+
+    async def execute(self, request: DelegationRequest) -> DelegationResult:
+        result = await super().execute(request)
+        if result.state.value == "succeeded":
+            result.payload = {
+                **result.payload,
+                "execution": {
+                    "kind": "constrained_agent",
+                    "transport": self.config.transport,
+                    "profile": self.config.profile,
+                    "capabilities": sorted(self.config.capabilities),
+                },
+            }
+        return result
 
 
 class StructuredProcessExecutor(ProcessExecutor):
@@ -454,6 +507,7 @@ def build_executors(config: GatewayConfig) -> list[Executor]:
     kinds = {
         "echo": EchoExecutor,
         "agent_process": AgentProcessExecutor,
+        "constrained_agent": ConstrainedAgentExecutor,
         "structured_process": StructuredProcessExecutor,
     }
     return [kinds[item.type](item, config) for item in config.executors]

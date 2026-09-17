@@ -71,7 +71,7 @@ A request may contain:
 The structured-process executor still enforces command, cwd, environment, risk, and capability policy. No shell string is evaluated.
 ## Result
 
-A normalized result contains the stable delegation ID, state, selected executor, timestamps, exit code, bounded stdout/stderr, optional payload/error, attempt history, replay flag, and durability.
+A normalized result contains the stable delegation ID, state, selected executor, timestamps, exit code, bounded stdout/stderr, optional payload/error, attempt history, replay flag, and durability. Executors may add non-authoritative provenance to `payload`; `constrained_agent` records its kind, transport, profile, and declared capabilities there.
 
 ```json
 {
@@ -109,7 +109,9 @@ If the gateway admission queue is full, POST returns `503 Service Unavailable` w
 
 When a token is configured, send `Authorization: Bearer <token>`. Non-loopback binds and any write/privileged-enabled gateway require a strong token.
 
-`GET /health` is an unauthenticated liveness endpoint by design. `GET /ready` is authenticated when a token is configured and verifies executor probes plus journal health.
+`GET /health` is an unauthenticated liveness endpoint by design. `GET /ready` is authenticated when a token is configured and verifies executor probes plus journal health. Readiness entries expose executor type, capabilities, allowed risks, transport, profile, routing tiers, readiness state, and failure reason.
+
+`aigw doctor` is the local operator equivalent of the readiness path: it loads and validates configuration, initializes the journal, runs executor probes, prints the resulting readiness document, and exits non-zero when the execution plane is not ready.
 
 ## Idempotency and conflicts
 

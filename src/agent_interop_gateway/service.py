@@ -63,7 +63,11 @@ class GatewayService:
                 ok, reason = await executor.probe()
             except Exception as exc:  # readiness must never crash the server
                 ok, reason = False, f"probe error: {type(exc).__name__}"
-            statuses[executor.name] = {"ready": ok, "reason": reason}
+            statuses[executor.name] = {
+                **executor.descriptor(),
+                "ready": ok,
+                "reason": reason,
+            }
             ready_count += int(ok)
         journal_ready = True
         if self._store:

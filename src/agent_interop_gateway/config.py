@@ -39,6 +39,10 @@ class ExecutorConfig:
     retry_exit_codes: set[int] = field(default_factory=set)
     transient_stderr_patterns: list[str] = field(default_factory=list)
     kill_grace_seconds: float = 2.0
+    transport: str | None = None
+    profile: str | None = None
+    probe_argv: list[str] = field(default_factory=list)
+    probe_timeout_seconds: float = 10.0
 
 
 @dataclass(slots=True)
@@ -91,6 +95,10 @@ def _executor_from_dict(raw: dict[str, Any]) -> ExecutorConfig:
         retry_exit_codes={int(x) for x in raw.get("retry_exit_codes", [])},
         transient_stderr_patterns=[str(x) for x in raw.get("transient_stderr_patterns", [])],
         kill_grace_seconds=float(raw.get("kill_grace_seconds", 2.0)),
+        transport=str(raw["transport"]) if raw.get("transport") else None,
+        profile=str(raw["profile"]) if raw.get("profile") else None,
+        probe_argv=[str(x) for x in raw.get("probe_argv", [])],
+        probe_timeout_seconds=float(raw.get("probe_timeout_seconds", 10.0)),
     )
 
 
@@ -159,7 +167,7 @@ def validate_config(config: GatewayConfig) -> None:
         raise ConfigError("max_queued_delegations must be >= max_concurrent_delegations")
 
     names: set[str] = set()
-    valid_types = {"echo", "agent_process", "structured_process"}
+    valid_types = {"echo", "agent_process", "constrained_agent", "structured_process"}
     for executor in config.executors:
         if not EXECUTOR_NAME.fullmatch(executor.name) or executor.name in names:
             raise ConfigError(
@@ -168,8 +176,14 @@ def validate_config(config: GatewayConfig) -> None:
         names.add(executor.name)
         if executor.type not in valid_types:
             raise ConfigError(f"unknown executor type {executor.type!r}")
-        if executor.enabled and executor.type == "agent_process" and not executor.argv:
-            raise ConfigError(f"enabled agent_process {executor.name!r} requires argv")
+        if (
+            executor.enabled
+            and executor.type in {"agent_process", "constrained_agent"}
+            and not executor.argv
+        ):
+            raise ConfigError(f"enabled {executor.type} {executor.name!r} requires argv")
+        if executor.enabled and executor.type == "constrained_agent" and not executor.probe_argv:
+            raise ConfigError(f"enabled constrained_agent {executor.name!r} requires probe_argv")
         if (
             executor.enabled
             and executor.type == "structured_process"
@@ -184,12 +198,21 @@ def validate_config(config: GatewayConfig) -> None:
             raise ConfigError(
                 f"executor {executor.name!r} concurrency/attempt limits must be positive"
             )
-        if executor.retry_backoff_seconds < 0 or executor.kill_grace_seconds < 0:
-            raise ConfigError(f"executor {executor.name!r} timing values cannot be negative")
+        if (
+            executor.retry_backoff_seconds < 0
+            or executor.kill_grace_seconds < 0
+            or executor.probe_timeout_seconds <= 0
+        ):
+            raise ConfigError(f"executor {executor.name!r} timing values are invalid")
         if not executor.allowed_risks or not executor.allowed_risks.issubset(
             {"read", "write", "privileged"}
         ):
             raise ConfigError(f"executor {executor.name!r} has invalid allowed_risks")
+        if executor.type == "constrained_agent" and executor.allowed_risks != {"read"}:
+            raise ConfigError(
+                f"constrained_agent {executor.name!r} must be read-only; "
+                "allowed_risks must equal [read]"
+            )
         for pattern in executor.transient_stderr_patterns:
             try:
                 re.compile(pattern)

@@ -6,7 +6,7 @@ This adapter demonstrates the intended AIGW architecture for read-only work on a
 ChatGPT Android
   -> native AccessibilityService companion
   -> AIGW HTTP gateway
-  -> agent_process executor
+  -> constrained_agent executor (`foundry-read-v1`)
   -> constrained Pi reasoning process
   -> Foundry MCP stdio gateway
   -> project-scoped runner / files
@@ -37,6 +37,14 @@ Provider/model selection remains deployment configuration. The adapter does not 
 
 The delegated natural-language task is passed to Pi only after AIGW policy has classified the request as `risk=read` and selected the read executor.
 
+## AIGW executor contract
+
+The profile is configured as `type = "constrained_agent"`, `transport = "local_mcp"`, `profile = "foundry-read-v1"`, and `allowed_risks = ["read"]`. AIGW rejects configuration that gives a constrained agent write or privileged risk.
+
+The profile must also provide `probe_argv`. For this adapter the probe validates the Pi runtime/profile and then calls `foundry_status` over the same MCP stdio authority plane used for real work. `aigw doctor --config examples/foundry-read-gateway.toml` runs that probe without starting the HTTP gateway.
+
+On successful execution, AIGW adds result provenance under `payload.execution`, including `kind=constrained_agent`, `transport=local_mcp`, `profile=foundry-read-v1`, and the declared capabilities. This is diagnostic provenance; authorization is decided before execution.
+
 ## MCP boundary
 
 The MCP client starts the local Foundry stdio launcher for each tool call, sends `initialize` and one `tools/call`, reads the bounded JSON-RPC response, then exits. Per-call process startup is intentional in the first reference implementation: it keeps lifecycle and recovery simple and prevents a stale MCP child from becoming hidden long-lived state.
@@ -57,7 +65,7 @@ For an untethered phone, use HTTPS through a private VPN/overlay or another auth
 
 ## Physical-phone acceptance test
 
-1. Start AIGW with the Foundry read executor and verify `/health` plus one CLI delegation.
+1. Run `aigw doctor` for the Foundry profile, then start AIGW and verify `/health`, `/ready`, and one CLI delegation.
 2. Connect or pair the Android phone with ADB and verify it appears in `adb devices -l`.
 3. Install the debug companion APK and configure the reversed loopback URL.
 4. Enable the AIGW AccessibilityService in Android settings.
@@ -71,4 +79,4 @@ Voice/Live mode is a separate compatibility test. Typed ChatGPT is the baseline 
 
 ## Current reference milestone
 
-The machine-side path has been exercised as a real delegation: AIGW selected `foundry-pi-read`, constrained Pi called the local Foundry MCP read plane, and AIGW returned a committed successful result. The remaining acceptance boundary is the current production ChatGPT Android UI on a physical device.
+The machine-side path has been exercised as a real delegation: AIGW selected the `foundry-pi-read` constrained-agent profile, constrained Pi called the local Foundry MCP read plane, and AIGW returned a committed successful result. The real readiness probe is also green against `foundry_status`. The remaining acceptance boundary is the current production ChatGPT Android UI on a physical device.

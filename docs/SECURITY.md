@@ -41,9 +41,11 @@ Do not publish a write-enabled AIGW listener directly to the public internet.
 
 `agent_process` passes natural-language task text through stdin. It does not interpolate task text into argv. The configured agent can still be powerful; run it as the least-privileged OS account that can do the required work.
 
-`structured_process` is stricter: the executable must be allowlisted, absolute paths are preferred, PATH lookup is opt-in, caller environment variables require allowlisting, and caller cwd must remain under configured roots.
+`constrained_agent` adds a stronger gateway contract for read-oriented reasoning: configuration validation requires exactly `allowed_risks = ["read"]`, a downstream readiness probe, and explicit transport/profile metadata. The reference Foundry profile additionally disables Pi built-in machine tools and independently allowlists MCP read tools.
 
-An executor's `allowed_risks` is independent of the gateway-wide risk gate. Enabling gateway writes does not make a read-only executor writable.
+`structured_process` is stricter in a different direction: the executable must be allowlisted, absolute paths are preferred, PATH lookup is opt-in, caller environment variables require allowlisting, and caller cwd must remain under configured roots. It is the appropriate family for state-capable typed actions, not `constrained_agent`.
+
+An executor's `allowed_risks` is independent of the gateway-wide risk gate. Enabling gateway writes does not make a read-only executor writable. A constrained read profile must never be widened in place to gain mutation authority; use a separate profile/executor with explicit write semantics.
 
 ## Retry safety
 
