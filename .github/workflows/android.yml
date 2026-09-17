@@ -62,6 +62,10 @@ jobs:
         run: |
           sudo chown root:kvm /dev/kvm
           sudo chmod 660 /dev/kvm
+      - name: Install emulator runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libpulse0
       - name: Install emulator image
         run: |
           yes | sdkmanager --licenses >/dev/null
