@@ -17,10 +17,12 @@ Ownership reminders (see FOUNDRY_EXECUTION_SUBSTRATE_V3):
   them). This module exposes no shell, no filesystem mutation, and no
   scheduler.
 - Artifact payloads are NEVER embedded in JSON and the gateway performs no
-  fetch/network/package logic. Attach carries the flat
+  fetch/network/package logic. Attach requires the flat
   ``foundry.artifact/v1`` manifest (exactly the Shiftio/agent-foundry field
   set, no invented schema) plus a typed staged-payload reference and
-  verification handoff that a real deployment client stages out-of-band.
+  verification handoff with deployment-confirmed evidence; payload bytes
+  are never embedded in JSON and the gateway runs no fetch/network/package
+  logic.
   The synthetic in-memory client below only validates schema/governance
   evidence and records the handoff; it never fetches, mounts, or executes.
 """
@@ -200,6 +202,10 @@ INLINE_PAYLOAD_FIELDS = frozenset(
 _HEX_RE = re.compile(r"^[0-9a-f]+$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
+# Immutable deployment-owned staging/CAS identifiers. The gateway never
+# fetches payloads, so a staged ref must be an opaque content-store handle
+# (``cas:<id>`` / ``staging:<id>``), never a URL, path, or shell string.
+_STAGED_REF_RE = re.compile(r"^(cas|staging):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHELL_METACHARS = (
     ";", "|", "&", "$", "`", "\n", "\r", "<", ">", "(", ")",
     "{", "}", "*", "?", "~", "!",
@@ -212,6 +218,49 @@ _NETWORK_TOKENS = frozenset(
 )
 _NETWORK_SCHEMES = ("http://", "https://", "ftp://", "sftp://", "ssh://")
 _NETWORK_FLAGS = ("--url", "--upload-file", "--remote")
+
+
+def validate_staged_ref(ref: str) -> str:
+    """Validate an immutable deployment-owned staging/CAS identifier."""
+    if not isinstance(ref, str) or not _STAGED_REF_RE.match(ref):
+        raise ArtifactValidationError(
+            "staged_payload.ref must be an immutable deployment-owned "
+            "staging/CAS identifier of the form 'cas:<id>' or 'staging:<id>' "
+            "(no URLs, paths, or shell syntax)"
+        )
+    lowered = ref.lower()
+    if (
+        "://" in ref
+        or any(scheme in lowered for scheme in _NETWORK_SCHEMES)
+        or any(meta in ref for meta in _SHELL_METACHARS)
+        or "/" in ref.split(":", 1)[-1]
+        or "\\" in ref
+        or ".." in ref
+    ):
+        raise ArtifactValidationError(
+            "staged_payload.ref must be an immutable deployment-owned "
+            "staging/CAS identifier (no URLs, paths, or shell syntax)"
+        )
+    return ref
+
+
+def validate_verification_evidence(evidence: str) -> str:
+    """Validate deployment-confirmed verification evidence."""
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise ArtifactValidationError(
+            "verification.evidence must be deployment-confirmed nonempty evidence"
+        )
+    text = evidence.strip()
+    if any(meta in text for meta in (";", "|", "&", "$", "`", "\n", "\r")):
+        raise ArtifactValidationError(
+            "verification.evidence must not contain shell metacharacters"
+        )
+    lowered = text.lower()
+    if any(scheme in lowered for scheme in _NETWORK_SCHEMES):
+        raise ArtifactValidationError(
+            "verification.evidence must not be a remote URL"
+        )
+    return text
 
 
 def canonical_hash(payload: dict[str, Any]) -> str:
@@ -494,7 +543,9 @@ class V3StagedPayloadRef(BaseModel):
 
     A real deployment client stages payload bytes outside JSON (content
     store, read-only mount source) and hands the gateway only this
-    reference. It never carries payload bytes.
+    reference. It never carries payload bytes. ``ref`` is an immutable
+    deployment-owned staging/CAS identifier (``cas:<id>``/``staging:<id>``);
+    URLs, paths, and shell syntax are rejected.
     """
 
     ref: str = Field(min_length=1)
@@ -502,6 +553,14 @@ class V3StagedPayloadRef(BaseModel):
     size: int = Field(ge=1)
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("ref")
+    @classmethod
+    def _ref_is_cas_identifier(cls, value: str) -> str:
+        try:
+            return validate_staged_ref(value)
+        except ArtifactValidationError as error:
+            raise ValueError(str(error)) from error
 
     @field_validator("digest")
     @classmethod
@@ -515,12 +574,15 @@ class V3VerificationHandoff(BaseModel):
     """Typed verification handoff for attach.
 
     Declares the governed named verification profile the deployment client
-    verified the staged payload under. The gateway never fetches payloads
+    verified the staged payload under, plus the deployment-confirmed
+    (nonempty) verification evidence. The gateway never fetches payloads
     or runs verification commands; the deployment adapter governs and
-    executes them.
+    executes them. The profile must also be declared in the manifest
+    ``verify_commands``.
     """
 
     profile: str = Field(min_length=1)
+    evidence: str = Field(min_length=1)
 
     model_config = {"extra": "forbid"}
 
@@ -532,6 +594,15 @@ class V3VerificationHandoff(BaseModel):
                 f"verification.profile must be one of {sorted(VERIFICATION_PROFILES)}"
             )
         return value
+
+
+    @field_validator("evidence")
+    @classmethod
+    def _evidence_is_confirmed(cls, value: str) -> str:
+        try:
+            return validate_verification_evidence(value)
+        except ArtifactValidationError as error:
+            raise ValueError(str(error)) from error
 
 
 class V3ArtifactConstraints(BaseModel):
@@ -554,8 +625,8 @@ class V3ArtifactConstraints(BaseModel):
 
 class V3AttachRequest(BaseModel):
     manifest: dict[str, Any]
-    staged_payload: V3StagedPayloadRef | None = None
-    verification: V3VerificationHandoff | None = None
+    staged_payload: V3StagedPayloadRef
+    verification: V3VerificationHandoff
     constraints: V3ArtifactConstraints | None = None
     expected_generation: int = Field(ge=1)
     idempotency_key: str = Field(min_length=1)
@@ -771,6 +842,7 @@ class _AttachmentEvidence:
     manifest: dict[str, Any]
     mount_point: str
     verified_profile: str
+    verification_evidence: str
     staged_ref: str
     actor: str
     attached_at: str
@@ -815,8 +887,10 @@ class InMemoryFoundryClient(FoundryClient):
     adapter.
 
     It never fetches payload bytes, mounts filesystems, or runs
-    verification commands: attach validates the flat foundry.artifact/v1
-    manifest and the staged-payload/verification handoff as evidence only.
+    verification commands: attach requires the deployment-supplied
+    staged-payload reference and verification handoff (both mandatory) and
+    records only that supplied, deployment-confirmed evidence — it never
+    fabricates mount points or verification profiles.
     """
 
     jobs: dict[str, _JobRecord] = field(default_factory=dict)
@@ -986,8 +1060,8 @@ class InMemoryFoundryClient(FoundryClient):
                 raise IllegalTransition(f"job in {job.state!r} cannot be quarantined")
         elif to_state == "cancel_requested" and job.state not in ("preparing", "ready", "running"):
             raise IllegalTransition(f"job in {job.state!r} cannot be cancelled")
-        elif to_state == "running" and job.state not in ("ready", "preparing", "accepted"):
-            raise IllegalTransition(f"job in {job.state!r} cannot execute")
+        elif to_state == "running" and job.state != "ready":
+            raise IllegalTransition(f"only a ready job can execute (job is {job.state!r})")
         from_state = job.state
         job.state = to_state
         job.updated_at = self._now()
@@ -1102,17 +1176,36 @@ class InMemoryFoundryClient(FoundryClient):
             quarantine_for_failure(error)
             raise
 
+        # Both halves of the deployment handoff are mandatory: the gateway
+        # records deployment-confirmed evidence only and never fabricates
+        # mount/profile evidence. Pydantic already rejects a missing handoff
+        # (422); the checks below treat a mismatched handoff as failed
+        # verification evidence (quarantine, durable).
         try:
-            if request.staged_payload is not None:
-                staged = request.staged_payload
-                if staged.digest != manifest["payload_digest"]:
-                    raise ArtifactVerificationError(
-                        "staged_payload.digest does not match the manifest payload_digest"
-                    )
-                if staged.size != manifest["payload_bytes"]:
-                    raise ArtifactVerificationError(
-                        "staged_payload.size does not match the manifest payload_bytes"
-                    )
+            staged = request.staged_payload
+            verification = request.verification
+            if staged is None or verification is None:
+                raise ArtifactValidationError(
+                    "attach requires both staged_payload and verification handoff"
+                )
+            validate_staged_ref(staged.ref)
+            validate_verification_evidence(verification.evidence)
+            if staged.digest != manifest["payload_digest"]:
+                raise ArtifactVerificationError(
+                    "staged_payload.digest does not match the manifest payload_digest"
+                )
+            if staged.size != manifest["payload_bytes"]:
+                raise ArtifactVerificationError(
+                    "staged_payload.size does not match the manifest payload_bytes"
+                )
+            named_profiles = [
+                c for c in manifest.get("verify_commands", []) if isinstance(c, str)
+            ]
+            if verification.profile not in named_profiles:
+                raise ArtifactVerificationError(
+                    f"verification.profile {verification.profile!r} does not match "
+                    "the manifest verify_commands"
+                )
             caller_constraints = (
                 {
                     k: v
@@ -1136,18 +1229,16 @@ class InMemoryFoundryClient(FoundryClient):
         now = self._now()
         if digest not in {str(m.get("payload_digest")) for m in self.attachments[job_id]}:
             self.attachments[job_id].append(manifest)
-        verified_profile = request.verification.profile if request.verification else ""
-        if not verified_profile:
-            named = [
-                c for c in manifest.get("verify_commands", []) if isinstance(c, str)
-            ]
-            verified_profile = named[0] if named else ""
+        # Record only deployment-supplied evidence: the mount handle is the
+        # deployment-owned staged ref and the verified profile/evidence are
+        # the deployment-confirmed handoff values. Nothing is synthesized.
         evidence = _AttachmentEvidence(
             artifact_digest=digest,
             manifest=dict(manifest),
-            mount_point=f"staged:{digest[:12]}",
-            verified_profile=verified_profile,
-            staged_ref=request.staged_payload.ref if request.staged_payload else "",
+            mount_point=staged.ref,
+            verified_profile=verification.profile,
+            verification_evidence=verification.evidence,
+            staged_ref=staged.ref,
             actor=request.actor,
             attached_at=now,
             generation=job.generation,
@@ -1192,23 +1283,17 @@ class InMemoryFoundryClient(FoundryClient):
         except StaleGeneration as error:
             self._idem_store_failure(scope, request.idempotency_key, payload, job, error)
             raise
-        if job.state not in ("accepted", "preparing", "ready"):
+        if job.state != "ready":
             error = IllegalTransition(
-                f"only a ready job can execute (job is {job.state!r})"
+                f"only a ready job can execute (job is {job.state!r}); "
+                "run the explicit synthetic preparation/readiness transition first"
             )
             self._idem_store_failure(scope, request.idempotency_key, payload, job, error)
             raise error
-        # The synthetic client advances accepted/preparing directly to running
-        # to keep the adapter path simple; intermediate states remain visible
-        # in the event log for fidelity with the Foundry machine.
-        for intermediate in ("preparing", "ready"):
-            if job.state == "accepted" and intermediate == "preparing":
-                self._transition(job, "preparing", actor=request.actor,
-                                 reason="preparing isolated workspace",
-                                 expected_generation=job.generation)
-            elif job.state == "preparing" and intermediate == "ready":
-                self._transition(job, "ready", actor=request.actor,
-                                 reason="workspace ready", expected_generation=job.generation)
+        # Hardened machine: execute performs only the ready -> running edge.
+        # The synthetic accepted/preparing -> ready path lives in
+        # mark_ready_for_test and must be invoked explicitly; execute never
+        # synthesizes readiness.
         # Two-phase launch reservation, mirrored synthetically: derive the
         # durable idempotent token from the idempotency scope/key, record the
         # reservation, then confirm with the native identity in the running
@@ -1291,7 +1376,36 @@ class InMemoryFoundryClient(FoundryClient):
         self._idem_store(f"job:{job_id}", request.idempotency_key, payload, response.model_dump())
         return response
 
-    # -- test/simulation helper (not a wire operation) --------------------
+    # -- test/simulation helpers (not wire operations) --------------------
+
+    def mark_ready_for_test(
+        self, job_id: str, *, actor: str = "foundry", expected_generation: int = 1
+    ) -> dict[str, Any]:
+        """Narrow synthetic preparation/readiness transition (tests only).
+
+        Mirrors the Foundry deployment's accepted -> preparing -> ready path
+        so tests exercise the hardened machine explicitly: execute only runs
+        from ready and never synthesizes readiness itself. Generation-fenced
+        and event-logged like every other edge.
+        """
+        job = self._get(job_id)
+        self._check_generation(job, expected_generation)
+        if job.state == "accepted":
+            self._transition(
+                job, "preparing", actor=actor,
+                reason="synthetic preparation", expected_generation=job.generation,
+            )
+        if job.state == "preparing":
+            self._transition(
+                job, "ready", actor=actor,
+                reason="synthetic readiness", expected_generation=job.generation,
+            )
+        if job.state != "ready":
+            raise IllegalTransition(
+                f"synthetic readiness only advances accepted/preparing jobs "
+                f"(job is {job.state!r})"
+            )
+        return self._job_dict(job)
 
     def settle_running(self, job_id: str, *, outcome: Literal["succeeded", "failed"] = "succeeded",
                        result: dict[str, Any] | None = None, actor: str = "foundry") -> None:
@@ -1408,6 +1522,7 @@ class InMemoryFoundryClient(FoundryClient):
                             "artifact_digest": evidence.artifact_digest,
                             "mount_point": evidence.mount_point,
                             "verified_profile": evidence.verified_profile,
+                            "verification_evidence": evidence.verification_evidence,
                             "staged_ref": evidence.staged_ref,
                             "actor": evidence.actor,
                             "attached_at": evidence.attached_at,

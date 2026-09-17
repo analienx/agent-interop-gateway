@@ -118,6 +118,9 @@ def attach_job(
     generation: int = 1,
     with_handoff: bool = True,
     constraints: dict | None = None,
+    profile: str = "sha256-check",
+    evidence: str = "attestation:deploy-1",
+    staged_ref: str = "cas:staged-1",
 ):
     body: dict = {
         "manifest": manifest,
@@ -125,11 +128,20 @@ def attach_job(
         "idempotency_key": key,
     }
     if with_handoff:
-        body["staged_payload"] = staged_handoff(manifest, payload)
-        body["verification"] = {"profile": "sha256-check"}
+        body["staged_payload"] = {
+            "ref": staged_ref,
+            "digest": manifest["payload_digest"],
+            "size": len(payload),
+        }
+        body["verification"] = {"profile": profile, "evidence": evidence}
     if constraints is not None:
         body["constraints"] = constraints
     return client.post(f"/v3/jobs/{job_id}:attach", headers=_auth(), json=body)
+
+
+def ready_via_synthetic_path(foundry: InMemoryFoundryClient, job_id: str) -> None:
+    """Advance a job through the explicit synthetic readiness transition."""
+    foundry.mark_ready_for_test(job_id)
 
 
 def execute_job(client: TestClient, job_id: str, key: str, identity: str = "native-1"):
@@ -230,10 +242,105 @@ def test_attach_full_handoff_records_typed_evidence():
         row = rows[0]
         assert row["manifest"]["schema_version"] == "foundry.artifact/v1"
         assert row["artifact_digest"] == manifest["payload_digest"]
-        assert row["mount_point"] == f"staged:{manifest['payload_digest'][:12]}"
+        # Evidence is recorded verbatim from the deployment handoff: the
+        # mount handle is the deployment-owned staged ref, never synthesized.
+        assert row["mount_point"] == "cas:staged-1"
         assert row["verified_profile"] == "sha256-check"
+        assert row["verification_evidence"] == "attestation:deploy-1"
         assert row["staged_ref"] == "cas:staged-1"
         assert row["generation"] == 1
+
+
+def test_attach_requires_both_staged_payload_and_verification():
+    foundry = InMemoryFoundryClient()
+    with _client(foundry=foundry) as client:
+        prep = prepare_job(client, "prep-nohandoff")
+        manifest, payload = make_manifest()
+        # Missing staged_payload.
+        missing_staged = client.post(
+            f"/v3/jobs/{prep['job_id']}:attach",
+            headers=_auth(),
+            json={
+                "manifest": manifest,
+                "verification": {"profile": "sha256-check",
+                                   "evidence": "attestation:deploy-1"},
+                "expected_generation": 1,
+                "idempotency_key": "attach-no-staged",
+            },
+        )
+        assert missing_staged.status_code == 422, missing_staged.text
+        # Missing verification.
+        missing_verification = client.post(
+            f"/v3/jobs/{prep['job_id']}:attach",
+            headers=_auth(),
+            json={
+                "manifest": manifest,
+                "staged_payload": staged_handoff(manifest, payload),
+                "expected_generation": 1,
+                "idempotency_key": "attach-no-verification",
+            },
+        )
+        assert missing_verification.status_code == 422, missing_verification.text
+        # Missing verification evidence.
+        missing_evidence = client.post(
+            f"/v3/jobs/{prep['job_id']}:attach",
+            headers=_auth(),
+            json={
+                "manifest": manifest,
+                "staged_payload": staged_handoff(manifest, payload),
+                "verification": {"profile": "sha256-check"},
+                "expected_generation": 1,
+                "idempotency_key": "attach-no-evidence",
+            },
+        )
+        assert missing_evidence.status_code == 422, missing_evidence.text
+        # Schema rejections must not quarantine or record evidence.
+        status = client.get(
+            f"/v3/jobs/{prep['job_id']}/status", headers=_auth()
+        ).json()
+        assert status["job"]["state"] == "accepted"
+        assert status["job"]["quarantine_reason"] is None
+        rows = client.get(
+            f"/v3/artifacts?job_id={prep['job_id']}", headers=_auth()
+        ).json()["items"]
+        assert rows == []
+
+
+def test_attach_rejects_remote_path_and_shell_refs():
+    with _client() as client:
+        for key, bad_ref in (
+            ("remote-url", "https://example.invalid/cas/1"),
+            ("remote-path", "/mnt/staging/artifact-1"),
+            ("remote-shell", "cas:staged-1; rm -rf /"),
+            ("remote-dotdot", "cas:../escape"),
+        ):
+            prep = prepare_job(client, f"prep-{key}")
+            manifest, payload = make_manifest()
+            resp = attach_job(
+                client, prep["job_id"], manifest, payload, f"attach-{key}",
+                staged_ref=bad_ref,
+            )
+            assert resp.status_code == 422, (key, resp.text)
+            status = client.get(
+                f"/v3/jobs/{prep['job_id']}/status", headers=_auth()
+            ).json()
+            assert status["job"]["state"] == "accepted", key
+
+
+def test_attach_profile_mismatch_quarantines():
+    with _client() as client:
+        prep = prepare_job(client, "prep-profmm")
+        manifest, payload = make_manifest()  # declares sha256-check
+        resp = attach_job(
+            client, prep["job_id"], manifest, payload, "attach-profmm",
+            profile="digest-check",
+        )
+        assert resp.status_code == 422, resp.text
+        status = client.get(
+            f"/v3/jobs/{prep['job_id']}/status", headers=_auth()
+        ).json()
+        assert status["job"]["state"] == "quarantined"
+        assert "verify_commands" in (status["job"]["quarantine_reason"] or "")
 
 
 def test_attach_rejects_inline_payload_bytes_and_quarantines():
@@ -258,6 +365,8 @@ def test_attach_staged_mismatch_quarantines_and_replay_is_stable():
                 "digest": "c" * 64,
                 "size": len(payload),
             },
+            "verification": {"profile": "sha256-check",
+                               "evidence": "attestation:deploy-1"},
             "expected_generation": 1,
             "idempotency_key": "attach-staged",
         }
@@ -311,7 +420,6 @@ def test_attach_unknown_and_model_fields_rejected():
         manifest, payload = make_manifest(model="smuggled")
         resp = attach_job(
             client, prep["job_id"], manifest, payload, "attach-unknown",
-            with_handoff=False,
         )
         assert resp.status_code == 422, resp.text
 
@@ -374,6 +482,7 @@ def test_attach_frozen_once_running_and_terminal():
         prep = prepare_job(client, "prep-freeze")
         manifest, payload = make_manifest()
         assert attach_job(client, prep["job_id"], manifest, payload, "a1").status_code == 200
+        ready_via_synthetic_path(foundry, prep["job_id"])
         assert execute_job(client, prep["job_id"], "e1").status_code == 200
 
         manifest2, payload2 = make_manifest(payload=b"second-payload")
@@ -404,7 +513,6 @@ def test_ungoverned_verification_rejected_and_quarantines():
             manifest, payload = make_manifest(verify_commands=commands)
             resp = attach_job(
                 client, prep["job_id"], manifest, payload, f"attach-{key}",
-                with_handoff=False,
             )
             assert resp.status_code == 422, (key, resp.text)
             status = client.get(
@@ -419,18 +527,20 @@ def test_named_profile_and_structured_argv_accepted():
         manifest, payload = make_manifest(verify_commands=["digest-check"])
         resp = attach_job(
             client, prep["job_id"], manifest, payload, "attach-named",
-            with_handoff=False,
+            profile="digest-check",
         )
         assert resp.status_code == 200, resp.text
 
         prep2 = prepare_job(client, "prep-argv")
         manifest2, payload2 = make_manifest(
             payload=b"argv-payload",
-            verify_commands=[["sha256sum", "--check", "manifest.sha256"]],
+            verify_commands=[
+                "sha256-check",
+                ["sha256sum", "--check", "manifest.sha256"],
+            ],
         )
         resp2 = attach_job(
             client, prep2["job_id"], manifest2, payload2, "attach-argv",
-            with_handoff=False,
         )
         assert resp2.status_code == 200, resp2.text
 
@@ -442,7 +552,8 @@ def test_handoff_profile_must_be_governed():
         body = {
             "manifest": manifest,
             "staged_payload": staged_handoff(manifest, payload),
-            "verification": {"profile": "curl-pipe"},
+            "verification": {"profile": "curl-pipe",
+                               "evidence": "attestation:deploy-1"},
             "expected_generation": 1,
             "idempotency_key": "attach-hprof",
         }
@@ -456,10 +567,12 @@ def test_handoff_profile_must_be_governed():
 
 
 def test_events_carry_source_artifact_and_policy_evidence():
-    with _client() as client:
+    foundry = InMemoryFoundryClient()
+    with _client(foundry=foundry) as client:
         prep = prepare_job(client, "prep-evidence")
         manifest, payload = make_manifest()
         assert attach_job(client, prep["job_id"], manifest, payload, "a1").status_code == 200
+        ready_via_synthetic_path(foundry, prep["job_id"])
         assert execute_job(client, prep["job_id"], "e1").status_code == 200
         status = client.get(
             f"/v3/jobs/{prep['job_id']}/status", headers=_auth()
@@ -481,6 +594,7 @@ def test_result_binds_frozen_evidence():
         prep = prepare_job(client, "prep-result")
         manifest, payload = make_manifest()
         assert attach_job(client, prep["job_id"], manifest, payload, "a1").status_code == 200
+        ready_via_synthetic_path(foundry, prep["job_id"])
         assert execute_job(client, prep["job_id"], "e1").status_code == 200
         foundry.settle_running(prep["job_id"], outcome="succeeded", result={"exit": 0})
         result = client.get(
@@ -493,10 +607,12 @@ def test_result_binds_frozen_evidence():
 
 
 def test_execute_requires_identity_and_reserves_launch_token():
-    with _client() as client:
+    foundry = InMemoryFoundryClient()
+    with _client(foundry=foundry) as client:
         prep = prepare_job(client, "prep-launch")
         manifest, payload = make_manifest()
         assert attach_job(client, prep["job_id"], manifest, payload, "a1").status_code == 200
+        ready_via_synthetic_path(foundry, prep["job_id"])
 
         missing = client.post(
             f"/v3/jobs/{prep['job_id']}:execute",
@@ -542,11 +658,40 @@ def test_execute_requires_identity_and_reserves_launch_token():
 
 
 def test_execute_from_running_rejected():
-    with _client() as client:
+    foundry = InMemoryFoundryClient()
+    with _client(foundry=foundry) as client:
         prep = prepare_job(client, "prep-rerun")
+        ready_via_synthetic_path(foundry, prep["job_id"])
         assert execute_job(client, prep["job_id"], "e1").status_code == 200
         again = execute_job(client, prep["job_id"], "e2")
         assert again.status_code == 409, again.text
+
+
+def test_execute_before_ready_rejected_without_mutation():
+    foundry = InMemoryFoundryClient()
+    with _client(foundry=foundry) as client:
+        prep = prepare_job(client, "prep-notready")
+        manifest, payload = make_manifest()
+        assert attach_job(
+            client, prep["job_id"], manifest, payload, "a1"
+        ).status_code == 200
+        before = client.get(
+            f"/v3/jobs/{prep['job_id']}/status", headers=_auth()
+        ).json()
+        # Accepted (and preparing) jobs must not execute: only the explicit
+        # synthetic readiness transition produces ready.
+        resp = execute_job(client, prep["job_id"], "e-early")
+        assert resp.status_code == 409, resp.text
+        after = client.get(
+            f"/v3/jobs/{prep['job_id']}/status", headers=_auth()
+        ).json()
+        assert after["job"]["state"] == "accepted"
+        assert after["job"]["frozen_artifact_digests"] == []
+        assert after["cursor"] == before["cursor"]
+        # The explicit synthetic path unblocks execute (fresh key: the early
+        # attempt stored a durable failure under its own idempotency key).
+        ready_via_synthetic_path(foundry, prep["job_id"])
+        assert execute_job(client, prep["job_id"], "e-ready").status_code == 200
 
 
 def test_stable_error_mapping():

@@ -74,7 +74,8 @@ def attach_body(manifest: dict, payload: bytes, key: str, generation: int = 1) -
             "digest": manifest["payload_digest"],
             "size": len(payload),
         },
-        "verification": {"profile": "sha256-check"},
+        "verification": {"profile": "sha256-check",
+                           "evidence": "attestation:deploy-1"},
         "expected_generation": generation,
         "idempotency_key": key,
     }
@@ -121,6 +122,7 @@ def test_v3_full_lifecycle_prepare_execute_status_result():
         )
         assert attach.status_code == 200, attach.text
 
+        foundry.mark_ready_for_test(job_id)
         exe = client.post(
             f"/v3/jobs/{job_id}:execute",
             headers=_auth(),
@@ -159,13 +161,15 @@ def test_v3_full_lifecycle_prepare_execute_status_result():
 
 
 def test_v3_cancel_and_quarantine():
-    with _client() as client:
+    foundry = InMemoryFoundryClient()
+    with _client(foundry=foundry) as client:
         prep = client.post(
             "/v3/jobs:prepare",
             headers=_auth(),
             json=prepare_body("prep-cancel", policy=None),
         ).json()
         job_id = prep["job_id"]
+        foundry.mark_ready_for_test(job_id)
         exe = client.post(
             f"/v3/jobs/{job_id}:execute",
             headers=_auth(),

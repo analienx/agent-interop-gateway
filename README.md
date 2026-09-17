@@ -15,11 +15,14 @@ The goal is simple: a conversation should be able to hand work to a computer you
   plus cursor/paginated bulk reads for projects, jobs, attempts, activity,
   artifacts, approvals, health, and evidence. Prepare carries the optional
   job-bound `artifact_policy` with policy-hash digest semantics; attach
-  carries the flat `foundry.artifact/v1` manifest plus a typed
-  staged-payload reference/verification handoff (payload bytes never travel
-  in JSON, and the gateway runs no fetch/network/package logic). Events and
+  requires the flat `foundry.artifact/v1` manifest plus a typed
+  staged-payload reference (`cas:`/`staging:` identifier) and a
+  verification handoff with deployment-confirmed evidence (payload bytes
+  never travel in JSON, and the gateway runs no fetch/network/package
+  logic). Events and
   results bind `source_digest`, `artifact_digests`, `policy_hash`, and the
-  frozen attachment set; execute mirrors the launch-reservation/native-
+  frozen attachment set; execute runs only from `ready` and mirrors the
+  launch-reservation/native-
   identity semantics with stable error mapping. The gateway never selects
   models, accounts, or cost tiers (Cline Model Optimizer owns routing) and
 exposes no general shell/filesystem mutation as a v3 tool.
