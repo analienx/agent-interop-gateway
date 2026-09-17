@@ -60,8 +60,10 @@ jobs:
           gradle-version: "8.9"
       - name: Enable KVM access
         run: |
-          sudo chown root:kvm /dev/kvm
-          sudo chmod 660 /dev/kvm
+          test -c /dev/kvm
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          ls -l /dev/kvm
       - name: Install emulator runtime dependencies
         run: |
           sudo apt-get update -qq
