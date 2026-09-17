@@ -76,21 +76,27 @@ jobs:
         run: |
           nohup emulator -avd aigw-ci -no-window -no-audio -no-boot-anim \
             -no-snapshot -gpu swiftshader_indirect -accel on >emulator.log 2>&1 &
-          timeout 90 adb wait-for-device
-          timeout 300 bash -c 'for i in $(seq 1 150); do prop=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r"); if [[ "$prop" == "1" ]]; then echo "boot completed after ~$((i * 2))s"; exit 0; fi; if (( i % 15 == 0 )); then echo "still waiting for boot... ~$((i * 2))s elapsed"; adb devices -l || true; fi; sleep 2; done; echo "ERROR: emulator boot timed out"; exit 1'
-          adb devices -l
-          adb shell input keyevent 82 || true
+          if ! timeout 90 adb wait-for-device; then
+            echo "ERROR: emulator never registered with ADB within 90s"
+            ps aux | grep -i emulator | grep -v grep || true
+            echo "--- emulator.log ---"
+            tail -n 300 emulator.log || true
+            exit 1
+          fi
+          timeout 300 bash -c 'for i in $(seq 1 150); do prop=$(timeout 5 adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" || true); if [[ "$prop" == "1" ]]; then echo "boot completed after ~$((i * 2))s"; exit 0; fi; if (( i % 15 == 0 )); then echo "still waiting for boot... ~$((i * 2))s elapsed"; timeout 5 adb devices -l || true; fi; sleep 2; done; echo "ERROR: emulator boot timed out"; exit 1'
+          timeout 5 adb devices -l || true
+          timeout 5 adb shell input keyevent 82 || true
       - name: Instrumented mobile tests
         run: gradle --no-daemon :android-companion:connectedDebugAndroidTest
       - name: Capture emulator diagnostics on failure
         if: failure()
         run: |
-          adb devices -l || true
-          adb shell getprop sys.boot_completed || true
-          adb logcat -d > android-logcat.txt || true
-          adb shell dumpsys activity activities > android-activity.txt || true
           ps aux | grep -i emulator | grep -v grep || true
           tail -n 300 emulator.log || true
+          timeout 5 adb devices -l || true
+          timeout 5 adb shell getprop sys.boot_completed || true
+          timeout 10 adb logcat -d > android-logcat.txt || true
+          timeout 10 adb shell dumpsys activity activities > android-activity.txt || true
       - name: Upload emulator diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
