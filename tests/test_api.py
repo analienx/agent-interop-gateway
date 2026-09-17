@@ -6,7 +6,7 @@ from agent_interop_gateway.config import ExecutorConfig, GatewayConfig
 
 def test_health_and_authenticated_delegation():
     config = GatewayConfig(
-        token="secret",
+        token="secret-secret-secret-secret-1234",
         executors=[ExecutorConfig(name="echo", type="echo", capabilities={"demo"})],
     )
     with TestClient(create_app(config)) as client:
@@ -14,14 +14,12 @@ def test_health_and_authenticated_delegation():
         assert health.status_code == 200
         assert health.json()["protocol"] == "aigw/1"
 
-        denied = client.post(
-            "/v1/delegations", json={"task": "hello", "capabilities": ["demo"]}
-        )
+        denied = client.post("/v1/delegations", json={"task": "hello", "capabilities": ["demo"]})
         assert denied.status_code == 401
 
         ok = client.post(
             "/v1/delegations",
-            headers={"Authorization": "Bearer secret"},
+            headers={"Authorization": "Bearer secret-secret-secret-secret-1234"},
             json={"task": "hello", "capabilities": ["demo"]},
         )
         assert ok.status_code == 200

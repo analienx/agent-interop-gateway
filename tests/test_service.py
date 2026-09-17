@@ -9,9 +9,7 @@ from agent_interop_gateway.service import GatewayService
 @pytest.mark.asyncio
 async def test_write_rejected_by_default():
     config = GatewayConfig(allow_write=False)
-    echo = EchoExecutor(
-        ExecutorConfig(name="echo", type="echo", capabilities={"demo"}), config
-    )
+    echo = EchoExecutor(ExecutorConfig(name="echo", type="echo", capabilities={"demo"}), config)
     service = GatewayService(config, [echo])
     result = await service.submit(
         DelegationRequest(task="change it", capabilities=["demo"], risk=Risk.WRITE)
@@ -23,9 +21,7 @@ async def test_write_rejected_by_default():
 @pytest.mark.asyncio
 async def test_read_executes():
     config = GatewayConfig()
-    echo = EchoExecutor(
-        ExecutorConfig(name="echo", type="echo", capabilities={"demo"}), config
-    )
+    echo = EchoExecutor(ExecutorConfig(name="echo", type="echo", capabilities={"demo"}), config)
     service = GatewayService(config, [echo])
     result = await service.submit(DelegationRequest(task="hello", capabilities=["demo"]))
     assert result.state == DelegationState.SUCCEEDED

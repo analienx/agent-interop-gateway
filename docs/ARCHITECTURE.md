@@ -1,55 +1,198 @@
 # Architecture
 
+This document describes the runtime architecture of Agent Interop Gateway (AIGW), the trust boundaries it introduces, and why the project separates conversation, bridging, policy, and execution.
+
+## System context
+
 ```text
-Conversation / voice / IDE / automation
-              |
-              | AIGW/1
-              v
-       +----------------+
-       | Bridge / relay |
-       +----------------+
-              |
-              v
-    +---------------------+
-    | Agent Interop       |
-    | Gateway             |
-    | - auth              |
-    | - policy            |
-    | - capability router |
-    +---------------------+
-       |       |       |
-       v       v       v
-     local   session   remote/custom
-     agent   agent     executor
-       |
-       v
-  user-controlled machine
+┌───────────────────────┐
+│ Human                 │
+│ voice / chat / IDE    │
+└───────────┬───────────┘
+            │
+            v
+┌───────────────────────┐
+│ Conversation surface  │  ChatGPT, another assistant, IDE, automation
+└───────────┬───────────┘
+            │ platform-supported bridge / relay
+            v
+┌───────────────────────┐
+│ AIGW bridge           │  normalize intent -> aigw/1
+└───────────┬───────────┘
+            │ authenticated HTTP
+            v
+┌────────────────────────────────────────────┐
+│ Agent Interop Gateway                     │
+│ auth -> validation -> policy -> journal   │
+│            -> router -> executor          │
+└───────┬──────────────┬──────────────┬──────┘
+        │              │              │
+        v              v              v
+ local/free agent   session agent   deterministic tool
+        │              │              │
+        └──────────────┴──────────────┘
+                       v
+              user-controlled machine
 ```
 
-The **conversation surface** talks with the user. It should not need to stream the desktop for ordinary machine work.
+The key architectural property is that the **conversation surface is not the execution plane**. It may request work and consume normalized results without maintaining a live graphical control loop.
 
-The **bridge** converts whatever the surface exposes into `aigw/1`. A native tool API is ideal; where none exists, a platform-specific bridge can inspect semantic UI state or use explicit OS automation.
+AIGW further separates the execution plane into three concerns:
 
-The **gateway** authenticates, applies machine-owner policy, selects an executor and normalizes results. It is not tied to a model provider.
+```text
+policy plane       risk + capability admission + routing
+reasoning plane    optional natural-language planner
+authority plane    MCP/API/typed command that can actually observe or mutate state
+```
 
-An **executor** does the work. It can be an LLM CLI, deterministic script, headless browser, SSH target, Home Assistant client, or another agent gateway.
+A model belongs to the reasoning plane. It does not become an authority boundary merely because it can produce tool calls.
 
-## Cost routing
+## Components
 
-Executor configuration has independent `priority`, `cost_tier`, and `quality_tier` values. This can express policies such as local/free first, then session-pass, then metered only as final fallback without hard-coding vendor names.
+### Conversation surface
+
+Owns the human interaction. AIGW does not require a specific provider or model. A surface can expose a first-party tool API, an IPC hook, an OS accessibility representation, or no integration at all.
+
+### Bridge
+
+Adapts a surface into `aigw/1`. Bridges should be thin: detect an explicit delegation, attach origin/capability/risk metadata, choose a stable delegation ID, submit it, and return the normalized result.
+
+Bridges are **not trusted to grant themselves machine privileges**. Gateway and executor policy remain authoritative.
+
+### Gateway
+
+The gateway owns machine-side policy and reliability semantics. The request path is:
+
+```text
+authentication
+  -> body/schema limits
+  -> request fingerprint/idempotency
+  -> durable claim
+  -> risk/capability policy
+  -> route candidates
+  -> execute with bounded resources
+  -> commit normalized result
+```
+
+`/health` answers process liveness. `/ready` additionally checks configured executor probes and the durable journal.
+
+### Durable journal
+
+SQLite in WAL mode stores delegation fingerprints, risk, state, result, owner, lease, and retention metadata. The journal coordinates multiple gateway processes and prevents the same stable delegation from executing twice after reconnect/restart.
+
+Read-only completed entries expire according to `result_ttl_seconds`. State-changing records are retained for a long safety window because forgetting an old write is more dangerous than retaining a small result record.
+
+### Router and executors
+
+The router filters by declared capabilities and executor `allowed_risks`, then orders candidates by the requested policy. Executors perform the actual work and report normalized attempts/results.
+
+For read-oriented agentic work, `constrained_agent` is the preferred executor contract. It is validation-enforced read-only, declares a `transport` and operator-defined `profile`, and requires a downstream `probe_argv`. The probe must demonstrate that the real authority plane is reachable; finding the launcher executable is not enough.
+
+Generic `agent_process` remains available for integrations that do not need this stronger contract. `structured_process` is the state-capable path and accepts explicit argv rather than interpreting natural language as shell syntax.
+## Execution and durability flow
+
+```text
+bridge             gateway                 journal                 executor
+  | POST id=42        |                       |                        |
+  |------------------>| fingerprint           |                        |
+  |                   |------ claim --------->|                        |
+  |                   |<----- acquired -------|                        |
+  |                   | policy + route        |                        |
+  |                   |------------------------------ execute -------->|
+  |                   |<----------------------------- result ----------|
+  |                   |------ complete ------>|                        |
+  |                   |<----- committed ------|                        |
+  |<-- result + durability=committed ----------|                        |
+```
+
+If another gateway already owns the claim, the caller receives a queued/in-progress representation instead of launching a duplicate. If a **read** lease expires, another gateway may reacquire it. If a **write/privileged** lease expires before a committed result exists, the record becomes `uncertain` and automatic replay is blocked.
+
+## Trust boundaries
+
+```text
+UNTRUSTED / VARIABLE                 MACHINE-OWNER TRUST DOMAIN
+conversation text                    gateway configuration
+third-party app UI        ->         bearer token
+bridge detection logic               durable journal
+network transport                     executor allowlists
+                                      OS account permissions
+```
+
+A natural-language task is data, not shell syntax. `agent_process` and `constrained_agent` write it to stdin. `structured_process` accepts argv only under command, cwd, environment, capability, and risk allowlists.
+
+The bearer token authenticates the bridge to the gateway; it does not elevate an executor beyond its configured policy or OS permissions.
 
 ## GUI efficiency hierarchy
 
-For inspection and control, bridges should prefer:
+Bridges should use the cheapest stable representation that can answer the question:
 
-1. First-party API / IPC / CLI.
-2. Structured application state or logs.
-3. OS semantic accessibility/UI automation tree.
-4. One-off screenshot for visual-only state.
-5. Interactive screen-driving loop only when no lower-cost representation exists.
+1. First-party API, IPC, CLI, or structured local protocol.
+2. Application state, logs, files, DOM, or semantic data model.
+3. OS accessibility / UI automation tree.
+4. One-off screenshot for genuinely visual state.
+5. Interactive screen-driving loop only as the final fallback.
 
-The Android reference bridge uses step 3 via `uiautomator dump` and exposes screenshots only as a diagnostic fallback.
+This ordering is architectural, not merely an optimization. Lower layers are usually easier to audit, cheaper to transmit, more deterministic, and less sensitive to pixel/layout changes.
+## Android bridge architecture
 
-## Current boundary
+The repository contains two Android implementations with different purposes.
 
-v0.1 executes synchronously and keeps result state in memory. Durable job queues, streaming events and distributed gateways are planned after the mobile interoperability path is empirically proven.
+**ADB diagnostic bridge:** developer-controlled, explicitly paired ADB connection; uses `uiautomator dump` for semantic snapshots and can capture a screenshot only as a diagnostic fallback. It is useful for probing a changing third-party UI but is not the preferred long-running transport.
+
+**Native companion:** an Android `AccessibilityService` scoped to the ChatGPT package. It reacts to accessibility events instead of polling video frames, requires an explicit delegation phrase by default, persists a duplicate-protection ledger, and uses `ACTION_SET_TEXT`/semantic send controls to return a result when exposed.
+
+The companion cannot make a third-party app expose controls that Android does not expose. Therefore ChatGPT Live compatibility is a **runtime compatibility property**, not a gateway guarantee.
+
+## Reference data path: Android + Foundry MCP
+
+The reference local-read implementation deliberately composes existing boundaries instead of making AIGW a machine-inspection framework:
+
+```text
+ChatGPT Android text/voice
+  -> AccessibilityService bridge
+  -> AIGW /v1/delegations
+  -> read-risk/capability policy
+  -> constrained_agent: foundry-pi-read
+  -> Pi with built-in machine tools disabled
+  -> explicit Foundry read-tool allowlist
+  -> MCP stdio
+  -> project-scoped Foundry runner
+```
+
+The Android bridge owns **conversation detection and result return**. AIGW owns **authentication, idempotency, policy, routing, and durability**. Pi owns **natural-language planning across the permitted tool surface**. Foundry owns **project identity, bounded reads/search, Git state, snapshots, and runner authority**.
+
+Remote-desktop control is intentionally outside this normal path. A deployment may retain it as a separate GUI/recovery capability, but ordinary repository inspection should not pay the cost or fragility of a screen-driving loop.
+
+The reference adapter has four independent constraints: AIGW structurally validates the executor as read-only; Pi has no built-in shell/filesystem tools active; the MCP client refuses tool names outside its explicit Foundry read allowlist; and the executor readiness probe performs a real `foundry_status` MCP call before the profile is considered healthy. See `FOUNDRY_MCP.md` and `EXECUTION_MODEL.md`.
+
+Successful constrained-agent results also carry non-authoritative execution provenance (`kind`, `transport`, `profile`, declared capabilities). This lets operators verify which boundary handled a request without making result metadata part of the permission decision.
+
+## Deployment shapes
+
+### Single-machine development
+
+`bridge -> http://127.0.0.1:<port> -> gateway -> local executor`. Port `8765` is the generic default. Loopback-only is the smallest trust surface.
+
+### Tethered Android development
+
+`Android companion -> 127.0.0.1:<port> -> adb reverse -> host gateway`. The phone sees loopback and the bearer token never needs to traverse the LAN. The current Foundry reference deployment uses port `8785`.
+
+### Untethered mobile
+
+Use HTTPS through a private VPN/overlay network or an authenticated reverse proxy. Do not expose a write-enabled gateway directly to the public internet.
+
+### Multiple gateway processes
+
+Processes may share the same SQLite journal on one host. Cross-process claims prevent duplicate work. SQLite is intentionally not presented as a distributed multi-host consensus database; multi-host deployments should use one authoritative gateway/journal or a future distributed backend.
+
+## Readiness and operator control
+
+`/health` proves only that the gateway process is alive. `/ready` evaluates the durable journal and each enabled executor probe. Executor readiness includes type, capabilities, risks, transport, profile, routing tiers, and a failure reason when unavailable.
+
+`aigw doctor` runs the same execution-plane checks without starting the web server. This is the preferred preflight before an Android or voice acceptance test because it distinguishes gateway configuration failures from conversation-surface compatibility failures.
+
+## Extension points
+
+New executors implement the executor interface and declare capabilities, risk allowlist, cost/quality tiers, concurrency, and retry policy. New bridges implement `aigw/1` and should keep provider-specific logic outside the gateway core.
+
+See `docs/adr/` for the decisions behind headless-first integration, durable idempotency, and the Android companion design.

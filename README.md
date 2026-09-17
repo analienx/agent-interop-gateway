@@ -1,34 +1,111 @@
 # Agent Interop Gateway
 
-**A model-agnostic bridge between conversational AI surfaces and user-controlled local executors.**
+**A model-agnostic interoperability layer between conversational AI surfaces and user-controlled executors.**
 
-The goal is simple: a conversation should be able to hand work to a computer you control **without forcing the conversation itself to become the computer-control runtime**. The gateway keeps expensive, screen-driven interaction out of the critical path and routes delegated work to the best available local or pass-based executor.
+Agent Interop Gateway (AIGW) lets a conversation delegate work to a machine you control without turning the conversation itself into a continuous remote-desktop session. The project separates the **human interface** from the **execution plane** so voice/chat can stay lightweight while local agents, scripts, CLIs, browsers, or other tools do the work.
 
-> Status: **v0.1 alpha / working gateway core + experimental Android/ADB bridge.** The Android-to-ChatGPT voice path is deliberately marked experimental because ChatGPT does not expose a public mobile tool-invocation interface to third-party software.
+> **Project status:** `0.2.0-alpha.1`. The gateway core, durable delegation semantics, Android companion/emulator coverage, and the Foundry MCP read reference path are implemented. The complete machine-side AIGW -> constrained Pi -> Foundry MCP chain has been exercised; typed and Live ChatGPT Android return behavior still requires acceptance against the current production app on a real device.
+
+## The simple idea
+
+Keep using the normal ChatGPT Android app. When you explicitly delegate something to your computer, AIGW moves only that task onto your machine and brings the result back into the same conversation.
+
+```text
+You type or speak in ChatGPT Android
+        |
+        |  "delegate locally: check the repo"
+        v
+Android companion
+        v
+AIGW
+        v
+constrained local agent
+        v
+MCP / structured local tools
+        v
+your machine
+        |
+        +------ result ------> same ChatGPT conversation
+```
+
+**ChatGPT remains the conversation. Your computer becomes an execution capability.** AIGW is not another chatbot and it does not require continuous remote-desktop streaming.
+
+## Best features
+
+- **Normal ChatGPT stays the UI.** Typed ChatGPT works directly; voice is an additional input surface, not a requirement.
+- **Explicit local delegation.** Phrases such as `delegate locally: inspect my repo` make the machine boundary obvious and reduce accidental execution.
+- **No continuous remote desktop.** Routine inspection uses structured local interfaces; GUI control is a fallback, not the architecture.
+- **MCP-first local reads.** The reference Foundry integration exposes project context, file reads, search, Git status, snapshots, and deltas through a read-only MCP surface.
+- **Constrained local reasoning.** The reference Pi launcher disables built-in filesystem/shell tools and exposes only the allowlisted Foundry read tools to the model.
+- **Same-conversation return.** The Android companion injects a marked local result into the existing ChatGPT conversation and verifies delivery when the semantic UI exposes the needed controls.
+- **Durable duplicate protection.** Stable IDs and local/gateway journals prevent a reconnect or UI event from silently executing the same request twice.
+- **Model and surface agnostic.** ChatGPT/Android is the reference bridge, but the gateway protocol and executor layer are not tied to one assistant or model vendor.
+
+## Reference implementation: Android -> Foundry MCP
+
+The repository includes a concrete read-only adapter under `scripts/foundry/`:
+
+```text
+ChatGPT Android -> Accessibility companion -> AIGW constrained_agent
+    -> constrained Pi -> Foundry MCP stdio -> project-scoped runner/files
+```
+
+`pi-read-extension.mjs` registers only the Foundry read allowlist. `run-read-agent.ps1` launches Pi with its built-in machine tools disabled and an explicit tool allowlist. `mcp-client.mjs` rejects any MCP tool outside that read allowlist before it reaches the Foundry server.
+
+This keeps the interoperability layer generic while demonstrating the intended architecture on a real local agent stack. See [`docs/FOUNDRY_MCP.md`](docs/FOUNDRY_MCP.md).
+
+## Why this exists
+
+Modern AI products often have excellent conversational and voice interfaces, while users already have cheaper, faster, or more capable execution paths on their own machines. Repeatedly capturing and driving a GUI is expensive, fragile, and wasteful when a structured path exists.
+
+AIGW defines a small boundary between those worlds:
+
+```text
+human <-> conversation surface <-> bridge <-> AIGW <-> executor <-> machine
+```
+
+The conversation surface does not need to know which model, vendor, or local runtime eventually performs the task.
+
+## Core design rules
+
+1. **Headless first.** Prefer APIs, CLIs, IPC, logs, structured application state, and semantic UI trees before screenshots or interactive screen control.
+2. **Model agnostic.** Executors can be local models, session/pass-based agents, deterministic tools, or remote services.
+3. **Fail closed for side effects.** Read work may be retried; state-changing work is never automatically replayed after an indeterminate interruption.
+4. **Durable idempotency.** Stable delegation IDs prevent duplicate execution across reconnects and gateway restarts.
+5. **Least privilege.** Loopback bind, read-only policy, constrained executors, and explicit capabilities are the defaults.
+6. **No private-API dependency.** Provider-specific bridges must use public/OS-supported mechanisms or clearly marked experiments.
+7. **Cost-aware routing.** Priority, cost tier, and quality tier are independent so operators can prefer free/local execution before metered fallbacks.
+
+## Execution architecture
+
+AIGW treats **bridges**, **policy**, and **machine authority** as separate layers. Android can request work, but it cannot grant itself filesystem or shell access. Machine authority lives behind configured executors.
+
+The preferred read path is the first-class `constrained_agent` executor. It is structurally read-only, declares its transport/profile, disables generic agent machine tools in the reference implementation, and must pass a downstream readiness probe before `/ready` or `aigw doctor` considers it healthy.
+
+This creates a reusable contract:
+
+```text
+conversation bridge -> aigw/1 -> policy/router -> constrained_agent
+    -> declared transport/tool plane -> user-controlled authority
+```
+
+Foundry MCP is the first reference profile (`foundry-read-v1`), not a hard-coded core dependency. See [`docs/EXECUTION_MODEL.md`](docs/EXECUTION_MODEL.md) for the executor contract and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for system boundaries.
 
 ## What is implemented
 
-- Neutral `aigw/1` delegation protocol.
-- FastAPI local gateway with bearer-token authentication.
-- Capability-based routing with `local_first`, `lowest_cost`, `quality_first`, or explicit executor selection.
-- Pluggable executor adapters:
-  - `agent_process`: sends natural-language work to any CLI agent over stdin.
-  - `structured_process`: executes an explicit argv action without `shell=True`.
-  - `echo`: deterministic test/demo executor.
-- Failover when an executor is unavailable.
-- Risk gates: writes and privileged operations are disabled by default.
-- Cross-platform CLI (`aigw`).
-- Experimental Android ADB bridge that prefers **semantic UI hierarchy dumps** over screenshots.
-- ChatGPT Android probe/injection tooling and a **dry-run-by-default** experimental semantic relay for empirical interoperability testing.
-- Tests and GitHub Actions CI on public standard runners.
-
-## Design principles
-
-1. **Headless first.** Prefer APIs, CLI, logs, semantic UI trees and structured automation. Use a screenshot only when semantic state is insufficient; avoid continuous screen takeover.
-2. **Model agnostic.** The gateway does not care whether the executor is Pi, Codex, Claude, a local model, a custom script, or something not invented yet.
-3. **Cost-aware.** Routing metadata separates operator priority, cost tier and quality tier.
-4. **User-controlled machine.** Default bind is `127.0.0.1`; write/privileged execution is opt-in.
-5. **No fake integration claims.** ChatGPT mobile voice currently has no public third-party tool API. The Android bridge is an interoperability experiment, not an official ChatGPT plugin.
+- `aigw/1` request/result protocol with strict schema validation.
+- FastAPI gateway with bearer authentication, request limits, security headers, health/readiness endpoints, and synchronous or asynchronous submission.
+- SQLite WAL journal for durable results, execution claims, replay protection, and cross-process coordination.
+- Explicit result durability: `volatile`, `committed`, or `uncertain`.
+- Capability/risk-aware routing with `local_first`, `lowest_cost`, `quality_first`, and explicit executor selection.
+- `constrained_agent`, `agent_process`, `structured_process`, and deterministic `echo` executors.
+- First-class executor transport/profile metadata and downstream readiness probes.
+- `aigw doctor` for config validation plus real execution-plane health checks.
+- Bounded subprocess output, concurrency limits, timeout cleanup, process-tree termination, executor probes, and read-only retries.
+- Android ADB diagnostic bridge using semantic UI state before screenshots.
+- Native Android AccessibilityService companion using event-driven semantic inspection, encrypted token storage, a durable local relay ledger, and fail-closed result injection.
+- Python CI on Linux and Windows across Python 3.11-3.13, Ruff, mypy, pytest, and coverage reporting.
+- Android lint/JVM build CI plus hardware-accelerated emulator instrumentation tests.
 
 ## Quick start
 
@@ -38,75 +115,73 @@ python -m venv .venv
 # Linux/macOS: source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Generate a token
-set AIGW_TOKEN=$(aigw token)        # cmd syntax differs by shell
+# Generate a strong bearer token
+aigw token
+```
 
-# Start the gateway
+Copy `examples/gateway.toml` to `~/.agent-interop-gateway/gateway.toml`, configure an executor, and set the token through `AIGW_TOKEN` rather than committing it to the file.
+Before starting the service, validate the complete configured execution plane:
+
+```bash
+aigw doctor --config ~/.agent-interop-gateway/gateway.toml
+```
+
+Then start the gateway:
+
+```bash
+export AIGW_TOKEN="..."          # PowerShell: $env:AIGW_TOKEN="..."
 aigw serve
 ```
 
-In another terminal:
+Then submit a delegation:
 
 ```bash
-aigw health
-
-aigw submit "hello from the conversation" --capability demo
+aigw submit "Inspect the repository and explain the failing tests" \
+  --capability fs.read --capability git
 ```
 
-For a real executor, copy `examples/gateway.toml` to `~/.agent-interop-gateway/gateway.toml`, enable an `agent_process`, and point its `argv` at a CLI that accepts a task on stdin.
+For longer work a bridge can request asynchronous acceptance with `Prefer: respond-async`; the gateway returns `202 Accepted` and the stable delegation ID can be polled at `GET /v1/delegations/{id}`.
 
-## Delegation example
+## Reliability semantics in one minute
 
-```json
-{
-  "protocol": "aigw/1",
-  "task": "Inspect the repository and explain why CI is failing.",
-  "origin": {"surface": "voice", "conversation_id": "optional"},
-  "capabilities": ["fs.read", "git"],
-  "risk": "read",
-  "routing": {
-    "preference": "lowest_cost",
-    "allow_fallback": true
-  }
-}
-```
+A caller chooses a stable delegation `id`. AIGW fingerprints the rest of the request. Reusing the same ID with the same payload returns the existing result; reusing it with a different payload is rejected.
 
-## Android: semantic inspection before screenshots
+For **read-only** work, an expired execution claim may be safely reacquired and configured transient failures may be retried. For **write/privileged** work, an expired claim becomes `uncertain`: AIGW refuses to silently run it again because the previous attempt may already have produced a side effect.
 
-With Android Platform Tools installed and a device explicitly paired through USB or Wireless debugging:
+A successful response with `durability=committed` means the normalized result was written to the durable journal while the gateway instance still owned the execution claim. See [`docs/RELIABILITY.md`](docs/RELIABILITY.md) for the full state model and failure matrix.
 
-```bash
-aigw-chatgpt-android probe
+## Android interoperability
 
-aigw-chatgpt-android snapshot
+There are two Android paths:
 
-aigw-chatgpt-android watch --interval 2
-```
+- **ADB bridge** — developer/diagnostic tool. It can inspect `uiautomator` semantic state and perform controlled experiments without streaming the screen.
+- **Native companion** — preferred runtime direction. It uses Android accessibility events scoped to `com.openai.chatgpt`, requires an explicit delegation phrase by default, and stores its bearer token using Android Keystore-backed AES-GCM encryption.
 
-`probe` reports whether ChatGPT is foreground, whether an editable message control is exposed, and the semantic text currently visible. `watch` **does not execute anything**; it only proves whether conversation text can be observed without screen capture. Once that is proven, `aigw-android-relay` can be run in dry-run mode and explicitly armed with `--arm` for end-to-end experiments.
-
-If the normal text composer is exposed, a test result can be inserted with:
-
-```bash
-aigw-chatgpt-android inject "[local delegation result] build passed"
-```
-
-See [`docs/CHATGPT_VOICE_EXPERIMENT.md`](docs/CHATGPT_VOICE_EXPERIMENT.md) before using this path. Live voice UI behavior can change between app versions and must be measured rather than assumed.
+For a tethered development test, keep the gateway loopback-only and reverse the configured port. The live Foundry reference deployment uses `8785`: `adb reverse tcp:8785 tcp:8785`. The generic gateway default remains `8765`.
+The Android emulator CI can validate **our companion app**—build, Android Keystore, local ledger, configuration defaults, and instrumentation behavior. It cannot prove the third-party ChatGPT app exposes the same accessibility/composer behavior as a signed-in real phone. That final boundary is deliberately tracked as a real-device compatibility test, not hidden behind a green CI badge.
 
 ## Repository map
 
-- `src/agent_interop_gateway/` – protocol models, routing, gateway, executors and Android bridge.
-- `docs/PROTOCOL.md` – wire contract.
-- `docs/ARCHITECTURE.md` – components and trust boundaries.
-- `docs/ANDROID_BRIDGE.md` – headless Android approach.
-- `docs/CHATGPT_VOICE_EXPERIMENT.md` – concrete validation plan for ChatGPT voice interoperability.
-- `docs/SECURITY.md` – threat model and safe defaults.
-- `docs/ROADMAP.md` – implementation phases.
+- `src/agent_interop_gateway/` — protocol models, policy, durable store, router, executors, HTTP API, CLI, and ADB relay.
+- `android-companion/` — native Android event-driven bridge.
+- `examples/gateway.toml` — hardened configuration reference.
+- `docs/ARCHITECTURE.md` — components, data flow, deployment shapes, and trust boundaries.
+- `docs/PROTOCOL.md` — `aigw/1` wire contract and asynchronous behavior.
+- `docs/RELIABILITY.md` — idempotency, claims, durability, retries, and crash semantics.
+- `docs/SECURITY.md` — threat model, authentication, executor isolation, and mobile security.
+- `docs/ANDROID_BRIDGE.md` — ADB and AccessibilityService bridge design.
+- `docs/FOUNDRY_MCP.md` — concrete Android -> AIGW -> constrained Pi -> Foundry MCP read path.
+- `docs/OPERATIONS.md` — installation, deployment, health checks, backups, and incident handling.
+- `docs/TESTING.md` — local/CI test strategy, Android emulator scope, and real-device validation.
+- `docs/STATUS.md` — capability and interoperability status matrix.
+- `docs/adr/` — architecture decision records.
 
-## Why this exists
+## Non-goals
 
-Conversational AI products increasingly have excellent voice interfaces, while local computers already have cheaper or more capable execution paths. Coupling the two through repeated GUI capture is wasteful and fragile. Agent Interop Gateway defines a small interoperability boundary so the conversation can remain conversational and the machine can remain an execution environment.
+AIGW does **not** reverse-engineer private ChatGPT APIs, bypass provider subscriptions/quotas, silently grant an AI unrestricted machine access, or treat continuous screen recording as the normal integration path.
 
-## License
+## Contributing
 
-Apache-2.0. Contributions and compatible executor/bridge adapters are welcome.
+The project is Apache-2.0 licensed and intentionally provider-neutral. New bridge or executor adapters should preserve the protocol boundary, declare their capability/risk model, include failure-mode tests, and document any external platform assumptions.
+
+Start with [`CONTRIBUTING.md`](CONTRIBUTING.md), then read the architecture and reliability docs before adding a state-changing executor.

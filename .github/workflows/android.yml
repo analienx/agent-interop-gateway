@@ -1,0 +1,122 @@
+name: Android CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+      - name: Android lint
+        run: gradle --no-daemon :android-companion:lintDebug
+      - name: JVM unit tests
+        run: gradle --no-daemon :android-companion:testDebugUnitTest
+      - name: Build debug APK
+        run: gradle --no-daemon :android-companion:assembleDebug
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: aigw-bridge-debug
+          path: android-companion/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  emulator-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Enable KVM access
+        run: |
+          test -c /dev/kvm
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          ls -l /dev/kvm
+      - name: Install emulator runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libpulse0
+      - name: Install emulator image
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" \
+            "emulator" "system-images;android-35;google_apis;x86_64"
+      - name: Create AVD
+        run: |
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/android-avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          echo no | avdmanager create avd --force --name aigw-ci \
+            --package "system-images;android-35;google_apis;x86_64"
+          avdmanager list avd
+          test -f "$ANDROID_AVD_HOME/aigw-ci.ini"
+      - name: Boot emulator
+        timeout-minutes: 8
+        run: |
+          EMULATOR="$ANDROID_SDK_ROOT/emulator/emulator"
+          test -x "$EMULATOR"
+          "$EMULATOR" -version
+          nohup "$EMULATOR" -avd aigw-ci -no-window -no-audio -no-boot-anim \
+            -no-snapshot -gpu swiftshader_indirect -accel on >emulator.log 2>&1 &
+          if ! timeout 90 adb wait-for-device; then
+            echo "ERROR: emulator never registered with ADB within 90s"
+            ps aux | grep -i emulator | grep -v grep || true
+            echo "--- emulator.log ---"
+            tail -n 300 emulator.log || true
+            exit 1
+          fi
+          timeout 300 bash -c 'for i in $(seq 1 150); do prop=$(timeout 5 adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r" || true); if [[ "$prop" == "1" ]]; then echo "boot completed after ~$((i * 2))s"; exit 0; fi; if (( i % 15 == 0 )); then echo "still waiting for boot... ~$((i * 2))s elapsed"; timeout 5 adb devices -l || true; fi; sleep 2; done; echo "ERROR: emulator boot timed out"; exit 1'
+          timeout 5 adb devices -l || true
+          timeout 5 adb shell input keyevent 82 || true
+      - name: Instrumented mobile tests
+        run: gradle --no-daemon :android-companion:connectedDebugAndroidTest
+      - name: Capture emulator diagnostics on failure
+        if: failure()
+        run: |
+          ps aux | grep -i emulator | grep -v grep || true
+          tail -n 300 emulator.log || true
+          timeout 5 adb devices -l || true
+          timeout 5 adb shell getprop sys.boot_completed || true
+          timeout 10 adb logcat -d > android-logcat.txt || true
+          timeout 10 adb shell dumpsys activity activities > android-activity.txt || true
+      - name: Upload emulator diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-emulator-diagnostics
+          path: |
+            android-logcat.txt
+            android-activity.txt
+            emulator.log
