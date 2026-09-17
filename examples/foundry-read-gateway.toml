@@ -24,6 +24,10 @@ probe_argv = [
   "scripts/foundry/probe-read-agent.ps1"
 ]
 probe_timeout_seconds = 20
+allowed_env = [
+  "AIGW_PI_AGENT_DIR", "AIGW_PI_PROVIDER", "AIGW_PI_MODEL",
+  "AIGW_FOUNDRY_MCP_STDIO"
+]
 capabilities = ["fs.read", "git", "foundry.read"]
 allowed_risks = ["read"]
 priority = 1

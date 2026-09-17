@@ -85,6 +85,11 @@ public final class MainActivity extends Activity {
         save.setOnClickListener(view -> saveConfiguration());
         root.addView(save);
 
+        Button testGateway = new Button(this);
+        testGateway.setText("Test gateway + executor");
+        testGateway.setOnClickListener(view -> testGateway(testGateway));
+        root.addView(testGateway);
+
         Button accessibility = new Button(this);
         accessibility.setText("Open Accessibility settings");
         accessibility.setOnClickListener(
@@ -163,6 +168,28 @@ public final class MainActivity extends Activity {
         } else {
             save.run();
         }
+    }
+
+    private void testGateway(Button button) {
+        button.setEnabled(false);
+        statusView.setText("Gateway diagnostic: testing...");
+        new Thread(() -> {
+            try {
+                String diagnosis = GatewayClient.diagnose(this);
+                runOnUiThread(() -> {
+                    statusView.setText("Gateway diagnostic: " + diagnosis);
+                    button.setEnabled(true);
+                });
+            } catch (Exception exc) {
+                String message = exc.getMessage() == null
+                        ? exc.getClass().getSimpleName()
+                        : exc.getMessage();
+                runOnUiThread(() -> {
+                    statusView.setText("Gateway diagnostic: FAILED\n" + message);
+                    button.setEnabled(true);
+                });
+            }
+        }, "aigw-gateway-diagnostic").start();
     }
 
     private void confirmClearHistory() {

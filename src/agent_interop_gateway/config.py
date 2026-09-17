@@ -213,6 +213,10 @@ def validate_config(config: GatewayConfig) -> None:
                 f"constrained_agent {executor.name!r} must be read-only; "
                 "allowed_risks must equal [read]"
             )
+        if executor.type == "constrained_agent" and not executor.transport:
+            raise ConfigError(f"constrained_agent {executor.name!r} requires an explicit transport")
+        if executor.type == "constrained_agent" and not executor.profile:
+            raise ConfigError(f"constrained_agent {executor.name!r} requires an explicit profile")
         for pattern in executor.transient_stderr_patterns:
             try:
                 re.compile(pattern)

@@ -95,6 +95,29 @@ final class GatewayClient {
         return result.toString();
     }
 
+    static String diagnose(Context context) throws Exception {
+        String baseUrl = ConfigStore.validateGatewayUrl(
+                ConfigStore.getGatewayUrl(context),
+                ConfigStore.isInsecureLanAllowed(context)
+        );
+        String token = SecretStore.loadToken(context);
+        JSONObject health = requestJson(
+                baseUrl + "/health", "GET", null, token, false, 10_000
+        );
+        JSONObject ready = requestJson(
+                baseUrl + "/ready", "GET", null, token, false, 15_000
+        );
+        if (!"ok".equals(health.optString("status"))) {
+            throw new IOException("Gateway health response is not OK.");
+        }
+        if (!ready.optBoolean("ready", false)) {
+            throw new IOException("Gateway execution plane is not ready: " + ready);
+        }
+        int readyExecutors = ready.optInt("ready_executors", 0);
+        String version = health.optString("version", "unknown");
+        return "Gateway " + version + " ready; executors=" + readyExecutors;
+    }
+
     private static boolean isInProgress(JSONObject result) {
         String state = result.optString("state", "");
         return state.equals("queued") || state.equals("running");

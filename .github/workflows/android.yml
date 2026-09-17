@@ -75,9 +75,10 @@ jobs:
         run: |
           nohup emulator -avd aigw-ci -no-window -no-audio -no-boot-anim \
             -no-snapshot -gpu swiftshader_indirect -accel on >emulator.log 2>&1 &
-          adb wait-for-device
+          timeout 90 adb wait-for-device
           timeout 180 bash -c 'until [[ "$(adb shell getprop sys.boot_completed | tr -d "\r")" == "1" ]]; do sleep 2; done'
           adb shell input keyevent 82
+          adb devices -l
       - name: Instrumented mobile tests
         run: gradle --no-daemon :android-companion:connectedDebugAndroidTest
       - name: Capture emulator diagnostics on failure

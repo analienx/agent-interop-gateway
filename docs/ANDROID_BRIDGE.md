@@ -46,17 +46,21 @@ ChatGPT accessibility event
 
 The startup baseline is important: enabling/restarting the service must not execute an old delegation phrase already visible in transcript history.
 
+The configuration activity deliberately separates **execution-plane diagnostics** from **conversation-surface diagnostics**. A failed gateway test means transport/auth/executor readiness must be fixed first; a passing gateway test followed by a failed ChatGPT round trip isolates the problem to the current accessibility/composer compatibility boundary.
+
 Before result injection the companion checks that the editor is empty so it cannot overwrite a draft the user is typing. Once a send action has been issued, failure to observe the unique result marker becomes `injection_uncertain`; automatic resend is blocked.
 
 ## Networking
 
-For development, use:
+For development, reverse the same port configured in the companion. The generic gateway default is `8765`; the Foundry reference deployment uses `8785`:
 
 ```bash
-adb reverse tcp:8765 tcp:8765
+adb reverse tcp:8785 tcp:8785
 ```
 
-and leave the companion gateway URL at `http://127.0.0.1:8765`. For untethered use, prefer HTTPS through a VPN/overlay or reverse proxy. Plain LAN HTTP is an explicit unsafe opt-in.
+Set the companion gateway URL to `http://127.0.0.1:8785`. Before enabling Accessibility, tap **Test gateway + executor**. The companion calls `/health` and authenticated `/ready`; a passing diagnostic proves phone-to-gateway transport, authentication, durable-journal readiness, and at least one usable executor without involving ChatGPT UI automation.
+
+For untethered use, prefer HTTPS through a VPN/overlay or reverse proxy. Plain LAN HTTP is an explicit unsafe opt-in.
 
 ## Secrets
 
