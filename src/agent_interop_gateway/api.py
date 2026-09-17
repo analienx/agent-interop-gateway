@@ -124,6 +124,8 @@ def create_app(
             "illegal_transition": 409,
             "job_not_ready": 409,
             "artifact_invalid": 422,
+            "artifact_verification": 422,
+            "policy_invalid": 422,
             "unknown_resource": 404,
             "invalid_cursor": 422,
             "missing_idempotency_key": 422,

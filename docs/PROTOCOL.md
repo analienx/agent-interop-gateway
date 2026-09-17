@@ -85,11 +85,69 @@ states on every write:
 
 Every mutating call requires an `idempotency_key`. Replays return the stored
 response with `replayed: true`; reusing a key with a different payload is a
-`409` conflict. Mutations carry `expected_generation` fencing; stale
-callers get `409`. Terminal states are immutable; cancelling an `accepted`
+`409` conflict, while a replayed durable failure re-raises the same error.
+The execute idempotency scope excludes the native identity, so a same-key
+replay reuses the committed identity instead of relaunching. Mutations carry
+`expected_generation` fencing, checked before any state change; stale
+callers get `409` without mutating, quarantining, or appending events.
+Terminal states are immutable; cancelling an `accepted`
 job is rejected (`409`) because the Foundry machine has no
 `accepted -> cancel_requested` edge. `read_result` before a terminal state
 is a `409`, never a guess.
+
+### Prepare: job-bound artifact policy
+
+`prepare` accepts an optional `artifact_policy` document with the required
+keys `source_repo`, `lock_digest`, `platform`, `arch`, `toolchain`,
+`lifecycle_policy` (one of `no-scripts`, `offline-only`, `hermetic`,
+`managed-postinstall`) and the optional `provenance_ref`. When present it
+is validated, persisted on the job, and bound to `policy_hash` as
+`sha256(canonical_json({"artifact_policy": policy}))`; an explicitly
+passed `policy_hash` must equal that digest (`422` otherwise). Later
+attaches enforce the stored policy: callers cannot omit or contradict
+declared constraints.
+
+### Attach: flat manifest plus staged-payload handoff
+
+`attach` carries the flat `foundry.artifact/v1` manifest — exactly the
+Shiftio/hardened-Foundry field set (`schema_version`, `kind`
+(`dir-archive`|`oci-image`), `producer`, `source_repo`, `source_commit`,
+`lock_digest`, `platform`, `arch`, `toolchain`, `payload_digest`,
+`payload_bytes`, `built_at`, `retention`, `lifecycle_policy`,
+`provenance_ref`, `verify_commands`) — plus a typed `staged_payload`
+reference (`ref`, `digest`, `size`) and a `verification` handoff naming
+the governed profile (`sha256-check`, `digest-check`, `signature-check`,
+`provenance-check`, `reproducibility-check`) the deployment client
+verified the staged bytes under. Optional `constraints` (`source_repo`,
+`lock_digest`, `platform`, `arch`, `toolchain`, `lifecycle_policy`,
+`provenance_ref`) may narrow but never contradict the stored policy.
+
+Payload bytes are never embedded in JSON: manifest keys such as `payload`,
+`content`, `data`, or `blob` are rejected (`422`), and `staged_payload`
+digest/size must equal the manifest values. The gateway performs no
+fetch/network/package logic and runs no verification commands — structured
+`verify_commands` argv is restricted to the offline allowlist
+(`sha256sum`, `shasum`, `sha256`, `cosign`, `openssl`, `tar`, `digest`)
+with no shell metacharacters or network tokens. Failed verification
+quarantines the job (`422`, durable under the idempotency key).
+Attachment is legal only in `accepted`/`preparing`/`ready`; `running`,
+`cancel_requested`, and terminal states reject (`409`) so execution
+evidence always binds the frozen set.
+
+### Evidence, launch, and error mapping
+
+Events carry `source_digest`, `artifact_digests`, and `policy_hash`;
+`read_result` and status snapshots bind `frozen_artifact_digests` (frozen
+at execute), `source_digest`, and `policy_hash`. Execute records a durable
+launch reservation derived from the idempotency scope/key, then confirms
+with the required native identity in the `ready -> running` transition.
+
+Stable mapping: `job_not_found`/`unknown_resource` → `404`;
+`idempotency_conflict`/`stale_generation`/`illegal_transition`/`job_not_ready`
+→ `409`; `artifact_invalid`/`artifact_verification`/`policy_invalid`/
+`invalid_cursor`/`missing_idempotency_key`/`missing_native_identity` →
+`422`. Request-schema violations (unknown fields, ungoverned profiles)
+are also `422`.
 
 Cursor/paginated bulk reads (all `GET /v3/{resource}?limit=&cursor=`):
 `projects`, `jobs`, `attempts`, `activity`, `artifacts`, `approvals`,
