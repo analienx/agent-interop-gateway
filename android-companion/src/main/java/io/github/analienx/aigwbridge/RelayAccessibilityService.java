@@ -306,7 +306,9 @@ public final class RelayAccessibilityService extends AccessibilityService {
         int visited = 0;
         while (!queue.isEmpty() && visited++ < MAX_TREE_NODES) {
             AccessibilityNodeInfo node = queue.removeFirst();
-            if (node.isVisibleToUser() && node.getText() != null) {
+            if (node.isVisibleToUser() && !node.isEditable() && node.getText() != null) {
+                // Only submitted transcript text may trigger delegation. The composer is
+                // deliberately excluded so merely typing an explicit trigger never executes it.
                 String text = normalize(node.getText().toString());
                 if (!text.isEmpty()) {
                     texts.add(text);

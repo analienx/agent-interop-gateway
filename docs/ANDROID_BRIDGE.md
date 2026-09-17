@@ -46,6 +46,8 @@ ChatGPT accessibility event
 
 The startup baseline is important: enabling/restarting the service must not execute an old delegation phrase already visible in transcript history.
 
+Delegation detection is transcript-only: text inside an editable ChatGPT composer is ignored. Typing `delegate locally ...` is therefore inert until the message has actually been submitted and appears in the conversation transcript.
+
 The configuration activity deliberately separates **execution-plane diagnostics** from **conversation-surface diagnostics**. A failed gateway test means transport/auth/executor readiness must be fixed first; a passing gateway test followed by a failed ChatGPT round trip isolates the problem to the current accessibility/composer compatibility boundary.
 
 Before result injection the companion checks that the editor is empty so it cannot overwrite a draft the user is typing. Once a send action has been issued, failure to observe the unique result marker becomes `injection_uncertain`; automatic resend is blocked.
