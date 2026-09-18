@@ -8,7 +8,30 @@ The goal is simple: a conversation should be able to hand work to a computer you
 
 ## What is implemented
 
-- Neutral `aigw/1` delegation protocol.
+- Neutral `aigw/1` delegation protocol (deprecated; returns `Deprecation: true`).
+- Typed `foundry/v3` adapter: forwards explicit Foundry
+  prepare/attach/execute/status/cancel/read-result/quarantine with
+  idempotency keys, request hashes, policy results, attempt ids, and states,
+  plus cursor/paginated bulk reads for projects, jobs, attempts, activity,
+  artifacts, approvals, health, and evidence. Prepare carries the optional
+  job-bound `artifact_policy` with policy-hash digest semantics; attach
+  requires the flat `foundry.artifact/v1` manifest plus a typed
+  staged-payload reference (`cas:`/`staging:` identifier) and one
+  **authenticated** typed deployment attachment receipt (verified by an
+  injected receipt verifier against a trusted issuer store or an opaque
+  server-side deployment receipt directory; binds artifact digest, staged
+  ref, separate read-only mount handle, verifier identity, canonical plan
+  hash, ordered per-step verified-step commitments, and the
+  issuance/expiry/replay-domain triple; one immutable receipt row per
+  job+generation+digest; payload bytes
+  never travel in JSON, and the gateway runs no fetch/network/package
+  logic). Events and
+  results bind `source_digest`, `artifact_digests`, `policy_hash`, and the
+  frozen attachment set; execute runs only from `ready` and mirrors the
+  launch-reservation/native-
+  identity semantics with stable error mapping. The gateway never selects
+  models, accounts, or cost tiers (Cline Model Optimizer owns routing) and
+exposes no general shell/filesystem mutation as a v3 tool.
 - FastAPI local gateway with bearer-token authentication.
 - Capability-based routing with `local_first`, `lowest_cost`, `quality_first`, or explicit executor selection.
 - Pluggable executor adapters:
