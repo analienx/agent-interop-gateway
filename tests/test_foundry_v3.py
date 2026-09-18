@@ -5,8 +5,8 @@ No live Foundry deployment, network egress, model routing, or host mutation
 is involved.
 
 Attach uses strict flat foundry.artifact/v1 manifests plus the typed
-staged-payload/verification handoff; payload bytes are never embedded in
-JSON.
+staged-payload reference and a typed deployment attachment receipt;
+payload bytes are never embedded in JSON.
 """
 
 import hashlib
@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from agent_interop_gateway.api import create_app
 from agent_interop_gateway.config import ExecutorConfig, GatewayConfig
-from agent_interop_gateway.foundry import InMemoryFoundryClient
+from agent_interop_gateway.foundry import InMemoryFoundryClient, build_attachment_receipt
 
 SOURCE = "a" * 40
 LOCK = "b" * 64
@@ -74,8 +74,12 @@ def attach_body(manifest: dict, payload: bytes, key: str, generation: int = 1) -
             "digest": manifest["payload_digest"],
             "size": len(payload),
         },
-        "verification": {"profile": "sha256-check",
-                           "evidence": "attestation:deploy-1"},
+        "receipt": build_attachment_receipt(
+            manifest,
+            staged_ref="cas:staged-1",
+            mount_handle="ro-mount:demo:staged-1",
+            verifier="synthetic-adapter/sha256-check",
+        ),
         "expected_generation": generation,
         "idempotency_key": key,
     }

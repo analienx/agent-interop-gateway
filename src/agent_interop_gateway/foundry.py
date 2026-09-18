@@ -244,21 +244,116 @@ def validate_staged_ref(ref: str) -> str:
     return ref
 
 
-def validate_verification_evidence(evidence: str) -> str:
-    """Validate deployment-confirmed verification evidence."""
-    if not isinstance(evidence, str) or not evidence.strip():
+def plan_hash_for_plan(normalized_plan: list[Any] | tuple[Any, ...]) -> str:
+    """Canonical hash of the complete normalized verify_commands plan.
+
+    Binds the attachment receipt to the exact manifest verification plan:
+    named profiles stay strings, structured argv stays token lists, and the
+    order is significant. Any missing/partial/reordered/mismatched plan
+    yields a different hash.
+    """
+    plan = [list(c) if isinstance(c, tuple) else c for c in normalized_plan]
+    return canonical_hash({"verify_commands": plan})
+
+
+def step_commitment(index: int, step: str | list[str]) -> str:
+    """Canonical commitment for one verified verification-plan step.
+
+    A deployment adapter proves it executed step ``index`` by returning this
+    digest; arbitrary evidence text or a CAS ref can never satisfy it.
+    """
+    normalized = list(step) if isinstance(step, (list, tuple)) else step
+    return canonical_hash({"index": index, "step": normalized})
+
+
+def build_attachment_receipt(
+    manifest: dict[str, Any],
+    *,
+    staged_ref: str,
+    mount_handle: str,
+    verifier: str,
+) -> dict[str, Any]:
+    """Build a typed deployment attachment receipt for a validated manifest.
+
+    This is the helper trusted deployment adapters use to produce the
+    receipt the gateway requires on attach. It computes the canonical plan
+    hash and per-step commitments from the *normalized* manifest plan, so
+    the receipt can never be constructed from arbitrary evidence text.
+    """
+    normalized_commands = validate_verify_commands(manifest.get("verify_commands"))
+    plan = [list(c) if isinstance(c, tuple) else c for c in normalized_commands]
+    return {
+        "artifact_digest": manifest["payload_digest"],
+        "staged_ref": staged_ref,
+        "mount_handle": mount_handle,
+        "verifier": verifier,
+        "plan_hash": plan_hash_for_plan(normalized_commands),
+        "steps": [
+            {
+                "index": i,
+                "step": list(s) if isinstance(s, tuple) else s,
+                "evidence_digest": step_commitment(i, s),
+            }
+            for i, s in enumerate(plan)
+        ],
+    }
+
+
+def _validate_mount_handle_shape(handle: str) -> str:
+    """Validate the shape of a deployment-supplied mount handle (nonempty)."""
+    if not isinstance(handle, str) or not handle.strip():
         raise ArtifactValidationError(
-            "verification.evidence must be deployment-confirmed nonempty evidence"
+            "receipt.mount_handle must be a nonempty immutable read-only "
+            "mount handle supplied by the deployment adapter"
         )
-    text = evidence.strip()
-    if any(meta in text for meta in (";", "|", "&", "$", "`", "\n", "\r")):
-        raise ArtifactValidationError(
-            "verification.evidence must not contain shell metacharacters"
-        )
+    text = handle.strip()
     lowered = text.lower()
-    if any(scheme in lowered for scheme in _NETWORK_SCHEMES):
+    if (
+        "://" in text
+        or any(scheme in lowered for scheme in _NETWORK_SCHEMES)
+        or any(meta in text for meta in _SHELL_METACHARS)
+    ):
         raise ArtifactValidationError(
-            "verification.evidence must not be a remote URL"
+            "receipt.mount_handle must not contain URLs or shell syntax"
+        )
+    return text
+
+
+def validate_mount_handle(handle: str, *, staged_ref: str | None = None) -> str:
+    """Validate a deployment-supplied immutable read-only mount handle.
+
+    The mount handle must be separate from the staged-payload CAS reference:
+    it is never derived from (or equal to) a ``cas:``/``staging:`` ref.
+    """
+    text = _validate_mount_handle_shape(handle)
+    if text.lower().startswith(("cas:", "staging:")):
+        raise ArtifactValidationError(
+            "receipt.mount_handle must not be derived from a CAS/staging ref"
+        )
+    if staged_ref is not None and text == staged_ref:
+        raise ArtifactValidationError(
+            "receipt.mount_handle must be a separate read-only mount handle, "
+            "not the staged_payload ref"
+        )
+    return text
+
+
+def validate_verifier_identity(verifier: str) -> str:
+    """Validate the deployment verifier identity/profile in a receipt."""
+    if not isinstance(verifier, str) or not verifier.strip():
+        raise ArtifactValidationError(
+            "receipt.verifier must be a nonempty deployment verifier "
+            "identity/profile"
+        )
+    text = verifier.strip()
+    lowered = text.lower()
+    if (
+        "://" in text
+        or any(scheme in lowered for scheme in _NETWORK_SCHEMES)
+        or any(meta in text for meta in _SHELL_METACHARS)
+    ):
+        raise ArtifactValidationError(
+            "receipt.verifier must not contain URLs or shell syntax"
         )
     return text
 
@@ -570,37 +665,56 @@ class V3StagedPayloadRef(BaseModel):
         return value
 
 
-class V3VerificationHandoff(BaseModel):
-    """Typed verification handoff for attach.
+class V3VerifiedStep(BaseModel):
+    """Structured verified-step evidence for one verification-plan step."""
 
-    Declares the governed named verification profile the deployment client
-    verified the staged payload under, plus the deployment-confirmed
-    (nonempty) verification evidence. The gateway never fetches payloads
-    or runs verification commands; the deployment adapter governs and
-    executes them. The profile must also be declared in the manifest
-    ``verify_commands``.
-    """
-
-    profile: str = Field(min_length=1)
-    evidence: str = Field(min_length=1)
+    index: int = Field(ge=0)
+    step: str | list[str]
+    evidence_digest: str = Field(min_length=1)
 
     model_config = {"extra": "forbid"}
 
-    @field_validator("profile")
-    @classmethod
-    def _profile_is_governed(cls, value: str) -> str:
-        if value not in VERIFICATION_PROFILES:
-            raise ValueError(
-                f"verification.profile must be one of {sorted(VERIFICATION_PROFILES)}"
-            )
-        return value
 
+class V3AttachmentReceipt(BaseModel):
+    """Typed deployment attachment receipt (replaces the loose handoff).
 
-    @field_validator("evidence")
+    Supplied by the trusted deployment adapter after it verified the staged
+    payload and mounted it read-only. Everything is validated:
+
+    - ``artifact_digest`` must equal the manifest ``payload_digest``;
+    - ``staged_ref`` must equal ``staged_payload.ref``;
+    - ``mount_handle`` must be a separate nonempty immutable read-only
+      mount handle and is never derived from the CAS ref;
+    - ``verifier`` is the deployment verifier identity/profile;
+    - ``plan_hash`` must be the canonical hash of the complete normalized
+      manifest ``verify_commands`` plan;
+    - ``steps`` must cover every declared named profile and every legal
+      structured argv step, in plan order, with per-step commitments that
+      only the deployment adapter can compute for the actual plan.
+    """
+
+    artifact_digest: str = Field(min_length=1)
+    staged_ref: str = Field(min_length=1)
+    mount_handle: str = Field(min_length=1)
+    verifier: str = Field(min_length=1)
+    plan_hash: str = Field(min_length=1)
+    steps: list[V3VerifiedStep] = Field(min_length=1)
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("mount_handle")
     @classmethod
-    def _evidence_is_confirmed(cls, value: str) -> str:
+    def _mount_handle_valid(cls, value: str) -> str:
         try:
-            return validate_verification_evidence(value)
+            return _validate_mount_handle_shape(value)
+        except ArtifactValidationError as error:
+            raise ValueError(str(error)) from error
+
+    @field_validator("verifier")
+    @classmethod
+    def _verifier_valid(cls, value: str) -> str:
+        try:
+            return validate_verifier_identity(value)
         except ArtifactValidationError as error:
             raise ValueError(str(error)) from error
 
@@ -626,7 +740,7 @@ class V3ArtifactConstraints(BaseModel):
 class V3AttachRequest(BaseModel):
     manifest: dict[str, Any]
     staged_payload: V3StagedPayloadRef
-    verification: V3VerificationHandoff
+    receipt: V3AttachmentReceipt
     constraints: V3ArtifactConstraints | None = None
     expected_generation: int = Field(ge=1)
     idempotency_key: str = Field(min_length=1)
@@ -840,9 +954,10 @@ class FoundryClient(ABC):
 class _AttachmentEvidence:
     artifact_digest: str
     manifest: dict[str, Any]
-    mount_point: str
-    verified_profile: str
-    verification_evidence: str
+    mount_handle: str
+    verifier: str
+    plan_hash: str
+    steps: list[dict[str, Any]]
     staged_ref: str
     actor: str
     attached_at: str
@@ -1176,20 +1291,20 @@ class InMemoryFoundryClient(FoundryClient):
             quarantine_for_failure(error)
             raise
 
-        # Both halves of the deployment handoff are mandatory: the gateway
-        # records deployment-confirmed evidence only and never fabricates
-        # mount/profile evidence. Pydantic already rejects a missing handoff
-        # (422); the checks below treat a mismatched handoff as failed
-        # verification evidence (quarantine, durable).
+        # The attachment receipt is mandatory: the gateway records a typed,
+        # deployment-supplied receipt only and never fabricates mount or
+        # verification evidence. Pydantic already rejects a missing receipt
+        # (422); the checks below bind the receipt to the manifest and the
+        # staged payload before anything is recorded.
         try:
             staged = request.staged_payload
-            verification = request.verification
-            if staged is None or verification is None:
+            receipt = request.receipt
+            if staged is None or receipt is None:
                 raise ArtifactValidationError(
-                    "attach requires both staged_payload and verification handoff"
+                    "attach requires both staged_payload and the deployment "
+                    "attachment receipt"
                 )
             validate_staged_ref(staged.ref)
-            validate_verification_evidence(verification.evidence)
             if staged.digest != manifest["payload_digest"]:
                 raise ArtifactVerificationError(
                     "staged_payload.digest does not match the manifest payload_digest"
@@ -1198,14 +1313,54 @@ class InMemoryFoundryClient(FoundryClient):
                 raise ArtifactVerificationError(
                     "staged_payload.size does not match the manifest payload_bytes"
                 )
-            named_profiles = [
-                c for c in manifest.get("verify_commands", []) if isinstance(c, str)
-            ]
-            if verification.profile not in named_profiles:
+            if receipt.artifact_digest != manifest["payload_digest"]:
                 raise ArtifactVerificationError(
-                    f"verification.profile {verification.profile!r} does not match "
-                    "the manifest verify_commands"
+                    "receipt.artifact_digest does not equal the manifest payload_digest"
                 )
+            if receipt.staged_ref != staged.ref:
+                raise ArtifactVerificationError(
+                    "receipt.staged_ref does not equal the staged_payload ref"
+                )
+            try:
+                mount_handle = validate_mount_handle(
+                    receipt.mount_handle, staged_ref=staged.ref
+                )
+            except ArtifactValidationError as error:
+                # Fabricated mounts are evidence failures (quarantine), not
+                # schema errors: the handle is present but not a real,
+                # separate, non-CAS read-only mount.
+                raise ArtifactVerificationError(str(error)) from error
+            try:
+                validate_verifier_identity(receipt.verifier)
+            except ArtifactValidationError as error:
+                raise ArtifactVerificationError(str(error)) from error
+            plan = manifest["verify_commands"]
+            if receipt.plan_hash != plan_hash_for_plan(plan):
+                raise ArtifactVerificationError(
+                    "receipt.plan_hash does not match the canonical hash of the "
+                    "normalized manifest verify_commands plan"
+                )
+            if len(receipt.steps) != len(plan):
+                raise ArtifactVerificationError(
+                    "receipt step evidence does not cover the manifest "
+                    "verify_commands plan (missing/partial evidence)"
+                )
+            for i, (rs, ps) in enumerate(zip(receipt.steps, plan, strict=False)):
+                if rs.index != i:
+                    raise ArtifactVerificationError(
+                        "receipt step evidence is reordered or has a wrong index"
+                    )
+                expected_step = list(ps) if isinstance(ps, (list, tuple)) else ps
+                if rs.step != expected_step:
+                    raise ArtifactVerificationError(
+                        "receipt step evidence does not match the manifest "
+                        "verify_commands plan (mismatched step)"
+                    )
+                if rs.evidence_digest != step_commitment(i, ps):
+                    raise ArtifactVerificationError(
+                        "receipt step evidence is not a valid verified-step "
+                        "commitment for this plan step"
+                    )
             caller_constraints = (
                 {
                     k: v
@@ -1229,15 +1384,16 @@ class InMemoryFoundryClient(FoundryClient):
         now = self._now()
         if digest not in {str(m.get("payload_digest")) for m in self.attachments[job_id]}:
             self.attachments[job_id].append(manifest)
-        # Record only deployment-supplied evidence: the mount handle is the
-        # deployment-owned staged ref and the verified profile/evidence are
-        # the deployment-confirmed handoff values. Nothing is synthesized.
+        # Record only deployment-supplied receipt evidence: the mount handle,
+        # verifier identity, plan hash, and verified-step commitments are the
+        # deployment adapter's typed receipt values. Nothing is synthesized.
         evidence = _AttachmentEvidence(
             artifact_digest=digest,
             manifest=dict(manifest),
-            mount_point=staged.ref,
-            verified_profile=verification.profile,
-            verification_evidence=verification.evidence,
+            mount_handle=mount_handle,
+            verifier=receipt.verifier,
+            plan_hash=receipt.plan_hash,
+            steps=[s.model_dump() for s in receipt.steps],
             staged_ref=staged.ref,
             actor=request.actor,
             attached_at=now,
@@ -1520,9 +1676,12 @@ class InMemoryFoundryClient(FoundryClient):
                             "job_id": jid,
                             "manifest": dict(evidence.manifest),
                             "artifact_digest": evidence.artifact_digest,
-                            "mount_point": evidence.mount_point,
-                            "verified_profile": evidence.verified_profile,
-                            "verification_evidence": evidence.verification_evidence,
+                            "mount_handle": evidence.mount_handle,
+                            "verifier": evidence.verifier,
+                            "plan_hash": evidence.plan_hash,
+                            "steps": [
+                                dict(s) for s in evidence.steps
+                            ],
                             "staged_ref": evidence.staged_ref,
                             "actor": evidence.actor,
                             "attached_at": evidence.attached_at,

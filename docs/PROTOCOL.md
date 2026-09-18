@@ -107,7 +107,7 @@ passed `policy_hash` must equal that digest (`422` otherwise). Later
 attaches enforce the stored policy: callers cannot omit or contradict
 declared constraints.
 
-### Attach: flat manifest plus staged-payload handoff
+### Attach: flat manifest plus staged payload and deployment receipt
 
 `attach` carries the flat `foundry.artifact/v1` manifest — exactly the
 Shiftio/hardened-Foundry field set (`schema_version`, `kind`
@@ -116,25 +116,47 @@ Shiftio/hardened-Foundry field set (`schema_version`, `kind`
 `payload_bytes`, `built_at`, `retention`, `lifecycle_policy`,
 `provenance_ref`, `verify_commands`) — plus a **required** typed
 `staged_payload` reference (`ref`, `digest`, `size`) and a **required**
-`verification` handoff (`profile`, `evidence`). `ref` is an immutable
+typed deployment attachment `receipt`. `ref` is an immutable
 deployment-owned staging/CAS identifier (`cas:<id>` / `staging:<id>`);
-URLs, paths, and shell syntax are rejected (`422`). `profile` must be a
-governed profile (`sha256-check`, `digest-check`, `signature-check`,
-`provenance-check`, `reproducibility-check`) **declared in the manifest
-`verify_commands`**, and `evidence` must be nonempty deployment-confirmed
-verification evidence. Optional `constraints` (`source_repo`,
+URLs, paths, and shell syntax are rejected (`422`). The receipt is
+supplied by the trusted deployment adapter after it verified the staged
+payload and mounted it read-only; it carries:
+
+- `artifact_digest` — must equal the manifest `payload_digest`;
+- `staged_ref` — must equal `staged_payload.ref`;
+- `mount_handle` — a separate nonempty immutable read-only mount handle
+  that is never derived from the CAS/staging ref;
+- `verifier` — the deployment verifier identity/profile;
+- `plan_hash` — the canonical hash of the complete normalized manifest
+  `verify_commands` plan (named profiles stay strings, structured argv
+  stays token lists, order is significant);
+- `steps` — structured verified-step evidence with one entry per plan
+  step (`index`, `step`, `evidence_digest`), covering every declared
+  named profile and every legal structured argv step in plan order.
+  Each `evidence_digest` must equal the deployment's canonical per-step
+  commitment (`canonical_hash({"index": i, "step": step})`); arbitrary
+  evidence text or a CAS ref can never satisfy it.
+
+Named-only, mixed (named + argv), and structured-argv-only
+`verify_commands` plans are all supported. Missing, partial, reordered,
+or mismatched step evidence is rejected before any attachment is
+recorded (`422`).
+
+Optional `constraints` (`source_repo`,
 `lock_digest`, `platform`, `arch`, `toolchain`, `lifecycle_policy`,
 `provenance_ref`) may narrow but never contradict the stored policy.
 
 Payload bytes are never embedded in JSON: manifest keys such as `payload`,
 `content`, `data`, or `blob` are rejected (`422`), and `staged_payload`
-digest/size must equal the manifest values. A missing handoff (or missing
-`verification.evidence`) is a `422` schema rejection with no quarantine
-and no recorded evidence; a mismatched handoff (digest/size/profile)
-quarantines the job (`422`, durable under the idempotency key). The
-gateway records only the deployment-supplied evidence — the mount handle
-is the deployment-owned staged ref and the verified profile/evidence are
-the deployment-confirmed handoff values; nothing is synthesized. The gateway performs no
+digest/size must equal the manifest values. A missing handoff (staged
+payload or receipt, or a receipt without steps) is a `422` schema
+rejection with no quarantine and no recorded evidence; a mismatched one
+(digest/size/mount/verifier/plan_hash/step evidence) quarantines the job
+(`422`, durable under the idempotency key). The
+gateway records only the deployment-supplied receipt — the mount handle,
+verifier identity, plan hash, and per-step commitments are the adapter's
+typed receipt values; nothing is synthesized and no evidence text is
+treated as proof. The gateway performs no
 fetch/network/package logic and runs no verification commands — structured
 `verify_commands` argv is restricted to the offline allowlist
 (`sha256sum`, `shasum`, `sha256`, `cosign`, `openssl`, `tar`, `digest`)

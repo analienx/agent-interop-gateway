@@ -49,6 +49,16 @@ Future versions should add per-capability grants, signed bridge identities and i
 - Every v3 write echoes the request hash, the adapter policy decision,
   the attempt id, and the resulting state, so callers can audit what was
   forwarded versus decided elsewhere.
+- Attach accepts only a typed deployment attachment receipt: the artifact
+  digest must equal the manifest, the staged ref must equal the staged
+  payload reference, and the mount handle must be a separate read-only
+  mount that is never derived from the CAS/staging ref. The receipt binds
+  the canonical hash of the complete normalized `verify_commands` plan and
+  per-step verified-step commitments covering every named profile and
+  structured argv step in order. Partial, reordered, mismatched, or
+  fabricated evidence quarantines the job; arbitrary evidence text and
+  CAS refs are never accepted as proof. The gateway never fabricates
+  mount points or verification outcomes.
 - `aigw/1` responses carry `Deprecation: true`. The Android ADB bridge
   and relay tooling are untouched by the v3 path.
 
