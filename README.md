@@ -16,10 +16,14 @@ The goal is simple: a conversation should be able to hand work to a computer you
   artifacts, approvals, health, and evidence. Prepare carries the optional
   job-bound `artifact_policy` with policy-hash digest semantics; attach
   requires the flat `foundry.artifact/v1` manifest plus a typed
-  staged-payload reference (`cas:`/`staging:` identifier) and one typed
-  deployment attachment receipt (artifact digest, staged ref, separate
-  read-only mount handle, verifier identity, canonical plan hash, and
-  per-step verified-step commitments; payload bytes
+  staged-payload reference (`cas:`/`staging:` identifier) and one
+  **authenticated** typed deployment attachment receipt (verified by an
+  injected receipt verifier against a trusted issuer store or an opaque
+  server-side deployment receipt directory; binds artifact digest, staged
+  ref, separate read-only mount handle, verifier identity, canonical plan
+  hash, ordered per-step verified-step commitments, and the
+  issuance/expiry/replay-domain triple; one immutable receipt row per
+  job+generation+digest; payload bytes
   never travel in JSON, and the gateway runs no fetch/network/package
   logic). Events and
   results bind `source_digest`, `artifact_digests`, `policy_hash`, and the

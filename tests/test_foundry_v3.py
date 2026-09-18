@@ -11,11 +11,13 @@ payload bytes are never embedded in JSON.
 
 import hashlib
 
+from _receipt_testkit import signed_receipt
+from _receipt_testkit import test_verifier as synthetic_verifier
 from fastapi.testclient import TestClient
 
 from agent_interop_gateway.api import create_app
 from agent_interop_gateway.config import ExecutorConfig, GatewayConfig
-from agent_interop_gateway.foundry import InMemoryFoundryClient, build_attachment_receipt
+from agent_interop_gateway.foundry import InMemoryFoundryClient
 
 SOURCE = "a" * 40
 LOCK = "b" * 64
@@ -35,7 +37,10 @@ def _client(token: str = "secret", foundry: InMemoryFoundryClient | None = None)
         token=token,
         executors=[ExecutorConfig(name="echo", type="echo", capabilities={"demo"})],
     )
-    app = create_app(config, foundry=foundry or InMemoryFoundryClient())
+    app = create_app(
+        config,
+        foundry=foundry or InMemoryFoundryClient(receipt_verifier=synthetic_verifier()),
+    )
     return TestClient(app)
 
 
@@ -66,7 +71,9 @@ def make_manifest(payload: bytes = b"adapter-payload", **overrides):
     return manifest, payload
 
 
-def attach_body(manifest: dict, payload: bytes, key: str, generation: int = 1) -> dict:
+def attach_body(
+    manifest: dict, payload: bytes, key: str, generation: int = 1, job_id: str = "",
+) -> dict:
     return {
         "manifest": manifest,
         "staged_payload": {
@@ -74,8 +81,10 @@ def attach_body(manifest: dict, payload: bytes, key: str, generation: int = 1) -
             "digest": manifest["payload_digest"],
             "size": len(payload),
         },
-        "receipt": build_attachment_receipt(
+        "receipt": signed_receipt(
             manifest,
+            job_id=job_id,
+            generation=generation,
             staged_ref="cas:staged-1",
             mount_handle="ro-mount:demo:staged-1",
             verifier="synthetic-adapter/sha256-check",
@@ -100,7 +109,7 @@ def prepare_body(key: str, source: str = SOURCE, policy: dict | None = POLICY) -
 
 
 def test_v3_full_lifecycle_prepare_execute_status_result():
-    foundry = InMemoryFoundryClient()
+    foundry = InMemoryFoundryClient(receipt_verifier=synthetic_verifier())
     with _client(foundry=foundry) as client:
         prep = client.post(
             "/v3/jobs:prepare",
@@ -122,7 +131,7 @@ def test_v3_full_lifecycle_prepare_execute_status_result():
         attach = client.post(
             f"/v3/jobs/{job_id}:attach",
             headers=_auth(),
-            json=attach_body(manifest, payload, "attach-1"),
+            json=attach_body(manifest, payload, "attach-1", job_id=job_id),
         )
         assert attach.status_code == 200, attach.text
 
@@ -165,7 +174,7 @@ def test_v3_full_lifecycle_prepare_execute_status_result():
 
 
 def test_v3_cancel_and_quarantine():
-    foundry = InMemoryFoundryClient()
+    foundry = InMemoryFoundryClient(receipt_verifier=synthetic_verifier())
     with _client(foundry=foundry) as client:
         prep = client.post(
             "/v3/jobs:prepare",

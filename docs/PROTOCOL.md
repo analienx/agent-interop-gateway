@@ -122,6 +122,9 @@ URLs, paths, and shell syntax are rejected (`422`). The receipt is
 supplied by the trusted deployment adapter after it verified the staged
 payload and mounted it read-only; it carries:
 
+- `issuer` — the deployment issuer identity, resolved against an
+  operator-configured trusted issuer store on the gateway side;
+- `job_id`, `generation` — the attach context the receipt was issued for;
 - `artifact_digest` — must equal the manifest `payload_digest`;
 - `staged_ref` — must equal `staged_payload.ref`;
 - `mount_handle` — a separate nonempty immutable read-only mount handle
@@ -136,6 +139,34 @@ payload and mounted it read-only; it carries:
   Each `evidence_digest` must equal the deployment's canonical per-step
   commitment (`canonical_hash({"index": i, "step": step})`); arbitrary
   evidence text or a CAS ref can never satisfy it.
+- `issued_at` / `expires_at` — ISO-8601 issuance window, capped at 24
+  hours; expired or over-long windows are rejected.
+- `replay_domain` — canonical domain binding job, generation, and digest,
+  so a receipt for one attach context can never be replayed elsewhere.
+- exactly one authentication channel: `mac` (issuer MAC over the
+  canonical statement) or `receipt_ref` (opaque server-side deployment
+  receipt handle).
+
+**Receipts are authenticated, not merely well-formed.** Plan hashes and
+per-step commitments hash only public manifest inputs, so they are
+bindable claims, never proof. An attach is accepted only after an
+injected `ReceiptVerifier` authenticates the receipt:
+
+- `HmacReceiptVerifier` verifies the issuer MAC against a trusted issuer
+  store (`issuer -> verification key`) configured by the deployment
+  operator; unknown issuers fail closed (`422`, quarantined).
+- `OpaqueReceiptDirectory` resolves an opaque `receipt_ref` server-side
+  and requires the claimed statement to equal the resolved deployment
+  statement exactly.
+
+The authenticated statement must bind `job_id`, `generation`,
+`artifact_digest`, `staged_ref`, the mount handle, verifier identity,
+complete plan hash, ordered step results, and the
+issuance/expiry/replay-domain triple. The gateway owns no signing
+secrets and never constructs or signs receipts. With **no trusted
+verifier configured, attach fails closed** (`503`,
+`verifier_not_configured`) — no attachment row, no quarantine: it is a
+deployment configuration error, not payload evidence.
 
 Named-only, mixed (named + argv), and structured-argv-only
 `verify_commands` plans are all supported. Missing, partial, reordered,
@@ -151,17 +182,27 @@ Payload bytes are never embedded in JSON: manifest keys such as `payload`,
 digest/size must equal the manifest values. A missing handoff (staged
 payload or receipt, or a receipt without steps) is a `422` schema
 rejection with no quarantine and no recorded evidence; a mismatched one
-(digest/size/mount/verifier/plan_hash/step evidence) quarantines the job
-(`422`, durable under the idempotency key). The
-gateway records only the deployment-supplied receipt — the mount handle,
-verifier identity, plan hash, and per-step commitments are the adapter's
-typed receipt values; nothing is synthesized and no evidence text is
+(digest/size/mount/verifier/plan_hash/step evidence) or a receipt that
+fails authentication (unknown issuer, bad MAC, expired, wrong replay
+domain) quarantines the job (`422`, durable under the idempotency key).
+The gateway records only an authenticated deployment receipt — the mount
+handle, verifier identity, plan hash, and per-step commitments come from
+the verified statement; nothing is synthesized and no evidence text is
 treated as proof. The gateway performs no
 fetch/network/package logic and runs no verification commands — structured
 `verify_commands` argv is restricted to the offline allowlist
 (`sha256sum`, `shasum`, `sha256`, `cosign`, `openssl`, `tar`, `digest`)
 with no shell metacharacters or network tokens. Failed verification
 quarantines the job (`422`, durable under the idempotency key).
+
+**Attachment receipts are immutable.** At most one receipt row exists
+per (`job_id`, `generation`, `artifact_digest`). Replaying the exact
+same signed receipt under a new idempotency key returns the original
+response (`200`, `replayed: true`) without appending or mutating any
+evidence; presenting a *conflicting* signed receipt for the same key
+triple is rejected (`409`, `receipt_conflict`) without appending or
+replacing the recorded row, and quarantines the job under the explicit
+conflict policy. The first accepted receipt is final.
 Attachment is legal only in `accepted`/`preparing`/`ready`; `running`,
 `cancel_requested`, and terminal states reject (`409`) so execution
 evidence always binds the frozen set.

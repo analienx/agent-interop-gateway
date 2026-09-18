@@ -49,16 +49,31 @@ Future versions should add per-capability grants, signed bridge identities and i
 - Every v3 write echoes the request hash, the adapter policy decision,
   the attempt id, and the resulting state, so callers can audit what was
   forwarded versus decided elsewhere.
-- Attach accepts only a typed deployment attachment receipt: the artifact
-  digest must equal the manifest, the staged ref must equal the staged
-  payload reference, and the mount handle must be a separate read-only
-  mount that is never derived from the CAS/staging ref. The receipt binds
-  the canonical hash of the complete normalized `verify_commands` plan and
-  per-step verified-step commitments covering every named profile and
-  structured argv step in order. Partial, reordered, mismatched, or
-  fabricated evidence quarantines the job; arbitrary evidence text and
-  CAS refs are never accepted as proof. The gateway never fabricates
-  mount points or verification outcomes.
+- Attach accepts only an **authenticated** typed deployment attachment
+  receipt. Plan hashes and per-step commitments hash only public manifest
+  inputs, so they are never accepted as proof on their own: an injected
+  `ReceiptVerifier` must authenticate the receipt either by verifying an
+  issuer MAC against an operator-configured trusted issuer store, or by
+  resolving an opaque server-side deployment receipt whose statement must
+  equal the claim exactly. The authenticated statement binds job id,
+  generation, artifact digest, staged ref, a separate immutable read-only
+  mount handle (never derived from the CAS/staging ref), verifier
+  identity, the canonical hash of the complete normalized
+  `verify_commands` plan, ordered per-step verified-step commitments
+  covering every named profile and structured argv step, and the
+  issuance/expiry/replay-domain triple (24-hour maximum receipt lifetime).
+  Partial, reordered, mismatched, tampered, expired, cross-job replayed,
+  or unknown-issuer receipts quarantine the job; arbitrary evidence text
+  and CAS refs are never accepted as proof. The gateway owns no signing
+  secrets and never fabricates mount points, verification outcomes, or
+  receipts; with no trusted verifier configured, attach fails closed
+  (`503`) until a trust store is injected.
+- Attachment evidence is immutable: exactly one receipt row exists per
+  (`job_id`, `generation`, `artifact_digest`). Replaying the identical
+  signed receipt under a new idempotency key returns the original
+  response without mutation; a conflicting signed receipt is rejected
+  (`409`, `receipt_conflict`) without appending or replacing evidence and
+  quarantines the job under the explicit conflict policy.
 - `aigw/1` responses carry `Deprecation: true`. The Android ADB bridge
   and relay tooling are untouched by the v3 path.
 

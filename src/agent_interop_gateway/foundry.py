@@ -30,13 +30,16 @@ Ownership reminders (see FOUNDRY_EXECUTION_SUBSTRATE_V3):
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import shlex
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -266,37 +269,301 @@ def step_commitment(index: int, step: str | list[str]) -> str:
     return canonical_hash({"index": index, "step": normalized})
 
 
-def build_attachment_receipt(
-    manifest: dict[str, Any],
-    *,
-    staged_ref: str,
-    mount_handle: str,
-    verifier: str,
-) -> dict[str, Any]:
-    """Build a typed deployment attachment receipt for a validated manifest.
+# -- authenticated attachment receipts (trust boundary) ----------------------
+#
+# The gateway is a transport adapter: it NEVER signs receipts, NEVER holds
+# issuer signing secrets, and NEVER treats public checksums or plan hashes
+# alone as proof. A receipt is accepted only after an injected
+# :class:`ReceiptVerifier` authenticates it as issued by a trusted
+# deployment issuer — either by verifying the issuer MAC over the canonical
+# statement (issuer trust store) or by resolving an opaque server-side
+# deployment receipt. With no trusted verifier configured, attach fails
+# closed (code ``verifier_not_configured``).
 
-    This is the helper trusted deployment adapters use to produce the
-    receipt the gateway requires on attach. It computes the canonical plan
-    hash and per-step commitments from the *normalized* manifest plan, so
-    the receipt can never be constructed from arbitrary evidence text.
+RECEIPT_STATEMENT_TYPE = "agent-interop-gateway/attachment-receipt/v1"
+
+# Upper bound on receipt validity. Receipts are short-lived deployment
+# attestations, not durable grants: expiry is checked against the gateway
+# clock on every attach.
+MAX_RECEIPT_TTL_SECONDS = 24 * 3600
+
+# Opaque server-side deployment receipt handles (never signed client-side).
+_RECEIPT_REF_RE = re.compile(r"^receipt:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def parse_iso_timestamp(value: str, *, field_name: str) -> datetime:
+    """Parse a timezone-aware ISO-8601 timestamp; raise ValueError if invalid."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} is not an ISO-8601 timestamp: {value!r}") from None
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+    return parsed
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def attachment_replay_domain(job_id: str, generation: int, artifact_digest: str) -> str:
+    """Anti-replay scope: one issuance binds to exactly this triple.
+
+    The authenticated statement carries its replay domain; the gateway
+    recomputes it from the actual attach context and rejects statements
+    bound to any other job, generation, or artifact digest.
     """
-    normalized_commands = validate_verify_commands(manifest.get("verify_commands"))
-    plan = [list(c) if isinstance(c, tuple) else c for c in normalized_commands]
-    return {
-        "artifact_digest": manifest["payload_digest"],
-        "staged_ref": staged_ref,
-        "mount_handle": mount_handle,
-        "verifier": verifier,
-        "plan_hash": plan_hash_for_plan(normalized_commands),
-        "steps": [
+    return canonical_hash(
+        {
+            "replay_domain": "agent-interop-gateway/foundry.v3/attach",
+            "job_id": job_id,
+            "generation": int(generation),
+            "artifact_digest": artifact_digest,
+        }
+    )
+
+
+def receipt_statement_from_receipt(receipt: V3AttachmentReceipt) -> dict[str, Any]:
+    """Canonical statement covered by the receipt authentication.
+
+    Excludes the authentication material itself (``mac``/``receipt_ref``)
+    and pins the statement type for domain separation.
+    """
+    data = receipt.model_dump(exclude={"mac", "receipt_ref"})
+    data["statement"] = RECEIPT_STATEMENT_TYPE
+    data["steps"] = [dict(step) for step in data["steps"]]
+    return data
+
+
+@dataclass(frozen=True)
+class ReceiptBinding:
+    """Gateway-computed attach context an authenticated statement must bind."""
+
+    job_id: str
+    generation: int
+    artifact_digest: str
+    replay_domain: str
+
+
+def _check_receipt_window(
+    statement: dict[str, Any], *, now: str, max_ttl_seconds: int
+) -> None:
+    """Enforce issuance/expiry on an authenticated statement."""
+
+    def parsed(name: str) -> datetime:
+        try:
+            return parse_iso_timestamp(statement[name], field_name=f"receipt.{name}")
+        except ValueError as error:
+            raise ReceiptVerificationError(str(error)) from None
+
+    issued = parsed("issued_at")
+    expires = parsed("expires_at")
+    current = parse_iso_timestamp(now, field_name="gateway clock")
+    if expires <= issued:
+        raise ReceiptVerificationError("attachment receipt expires_at must be after issued_at")
+    if (expires - issued).total_seconds() > max_ttl_seconds:
+        raise ReceiptVerificationError(
+            "attachment receipt ttl exceeds the maximum receipt window"
+        )
+    if current < issued:
+        raise ReceiptVerificationError("attachment receipt issued_at is in the future")
+    if current >= expires:
+        raise ReceiptVerificationError("attachment receipt is expired")
+
+
+def _check_receipt_binding(statement: dict[str, Any], binding: ReceiptBinding) -> None:
+    """Bind the authenticated statement to the actual attach context."""
+    mismatches: list[str] = []
+    if statement.get("job_id") != binding.job_id:
+        mismatches.append("job_id")
+    if statement.get("generation") != binding.generation:
+        mismatches.append("generation")
+    if statement.get("artifact_digest") != binding.artifact_digest:
+        mismatches.append("artifact_digest")
+    if statement.get("replay_domain") != binding.replay_domain:
+        mismatches.append("replay_domain")
+    if mismatches:
+        raise ReceiptVerificationError(
+            "attachment receipt statement does not bind this attach context "
+            f"(mismatched: {', '.join(mismatches)})"
+        )
+
+
+def _receipt_mac(key: bytes, statement: dict[str, Any]) -> str:
+    return hmac.new(key, canonical_json_bytes(statement), hashlib.sha256).hexdigest()
+
+
+class ReceiptVerifier(ABC):
+    """Trust boundary for deployment attachment receipts.
+
+    Implementations authenticate a receipt as issued by a trusted
+    deployment issuer — either by verifying issuer-signed MACs/signatures
+    against an issuer trust store, or by resolving an opaque server-side
+    deployment receipt. The gateway never signs receipts, never holds
+    issuer signing secrets, and never accepts public checksums or plan
+    hashes alone as proof of a mount or a verification outcome.
+    """
+
+    @abstractmethod
+    def verify_receipt(
+        self, receipt: V3AttachmentReceipt, *, binding: ReceiptBinding, now: str
+    ) -> dict[str, Any]:
+        """Authenticate ``receipt`` and return its verified statement.
+
+        Raises :class:`ReceiptVerificationError` when the receipt is not
+        from a trusted issuer, its authentication material does not verify,
+        it is expired or over-long-lived, or its statement does not bind
+        the exact attach context carried in ``binding``.
+        """
+
+
+@dataclass(frozen=True)
+class HmacReceiptIssuer:
+    """Deployment-side attachment-receipt signer (never runs in the gateway).
+
+    The signing key lives with the deployment adapter that actually
+    verified the payload and mounted it read-only. The gateway holds no
+    issuer signing secrets and never constructs receipts: issuance
+    happens server-side, and the gateway only ever verifies.
+    """
+
+    issuer: str
+    key: bytes
+
+    def issue_statement(self, statement: dict[str, Any]) -> dict[str, Any]:
+        """Sign a complete canonical statement; returns the receipt dict.
+
+        The returned wire receipt carries no ``statement`` type marker: the
+        verifier reconstructs the canonical statement (including the pinned
+        marker) before checking the MAC, so both sides MAC identical bytes.
+        """
+        body = {
+            **statement,
+            "statement": RECEIPT_STATEMENT_TYPE,
+            "issuer": self.issuer,
+        }
+        receipt = {k: v for k, v in body.items() if k != "statement"}
+        return {**receipt, "mac": _receipt_mac(self.key, body)}
+
+    def issue(
+        self,
+        *,
+        job_id: str,
+        generation: int,
+        artifact_digest: str,
+        staged_ref: str,
+        mount_handle: str,
+        verifier: str,
+        plan_hash: str,
+        steps: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        issued_at: str | None = None,
+        expires_at: str | None = None,
+        replay_domain: str | None = None,
+    ) -> dict[str, Any]:
+        """Issue a well-formed receipt for one verified deployment attach."""
+        if issued_at is None:
+            issued_at = _utc_now_iso()
+        if expires_at is None:
+            expires_at = (
+                parse_iso_timestamp(issued_at, field_name="issued_at")
+                + timedelta(seconds=3600)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return self.issue_statement(
             {
-                "index": i,
-                "step": list(s) if isinstance(s, tuple) else s,
-                "evidence_digest": step_commitment(i, s),
+                "job_id": job_id,
+                "generation": int(generation),
+                "artifact_digest": artifact_digest,
+                "staged_ref": staged_ref,
+                "mount_handle": mount_handle,
+                "verifier": verifier,
+                "plan_hash": plan_hash,
+                "steps": [dict(step) for step in steps],
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+                "replay_domain": (
+                    replay_domain
+                    if replay_domain is not None
+                    else attachment_replay_domain(job_id, generation, artifact_digest)
+                ),
             }
-            for i, s in enumerate(plan)
-        ],
-    }
+        )
+
+
+@dataclass(frozen=True)
+class HmacReceiptVerifier(ReceiptVerifier):
+    """Issuer trust store verifying HMAC-signed attachment receipts.
+
+    ``issuers`` maps trusted issuer identities to their verification keys.
+    It is injected by the deployment operator: the gateway owns no signing
+    secrets, and an empty trust store rejects every receipt (fail closed).
+    """
+
+    issuers: Mapping[str, bytes] = field(default_factory=dict)
+    max_ttl_seconds: int = MAX_RECEIPT_TTL_SECONDS
+
+    def verify_receipt(
+        self, receipt: V3AttachmentReceipt, *, binding: ReceiptBinding, now: str
+    ) -> dict[str, Any]:
+        key = self.issuers.get(receipt.issuer)
+        if key is None:
+            raise ReceiptVerificationError(
+                f"attachment receipt issuer {receipt.issuer!r} is not in the "
+                "trusted issuer store; attach fails closed for untrusted issuers"
+            )
+        if receipt.mac is None or receipt.receipt_ref is not None:
+            raise ReceiptVerificationError(
+                "signed attachment receipt requires a mac and must not carry "
+                "an opaque receipt_ref"
+            )
+        statement = receipt_statement_from_receipt(receipt)
+        expected = _receipt_mac(key, statement)
+        if not hmac.compare_digest(expected, receipt.mac):
+            raise ReceiptVerificationError(
+                "attachment receipt mac does not verify against the trusted "
+                f"issuer {receipt.issuer!r}"
+            )
+        _check_receipt_window(statement, now=now, max_ttl_seconds=self.max_ttl_seconds)
+        _check_receipt_binding(statement, binding)
+        return statement
+
+
+@dataclass(frozen=True)
+class OpaqueReceiptDirectory(ReceiptVerifier):
+    """Opaque server-side deployment receipt resolution.
+
+    ``resolve`` queries the deployment's server-side receipt directory for
+    an opaque ``receipt_ref`` and returns the canonical statement recorded
+    there (or None when the ref is unknown or revoked). The claimed
+    statement must equal the resolved one exactly, so a caller cannot
+    present a real reference with rewritten fields.
+    """
+
+    resolve: Callable[[str], dict[str, Any] | None]
+    max_ttl_seconds: int = MAX_RECEIPT_TTL_SECONDS
+
+    def verify_receipt(
+        self, receipt: V3AttachmentReceipt, *, binding: ReceiptBinding, now: str
+    ) -> dict[str, Any]:
+        if receipt.receipt_ref is None or receipt.mac is not None:
+            raise ReceiptVerificationError(
+                "opaque attachment receipt requires receipt_ref and must not "
+                "carry a mac"
+            )
+        resolved = self.resolve(receipt.receipt_ref)
+        if resolved is None:
+            raise ReceiptVerificationError(
+                f"opaque receipt {receipt.receipt_ref!r} is not known to the "
+                "deployment receipt directory"
+            )
+        claimed = receipt_statement_from_receipt(receipt)
+        if canonical_json_bytes(claimed) != canonical_json_bytes(resolved):
+            raise ReceiptVerificationError(
+                "opaque attachment receipt does not match the statement "
+                "resolved from the deployment receipt directory"
+            )
+        _check_receipt_window(resolved, now=now, max_ttl_seconds=self.max_ttl_seconds)
+        _check_receipt_binding(resolved, binding)
+        return resolved
 
 
 def _validate_mount_handle_shape(handle: str) -> str:
@@ -315,6 +582,14 @@ def _validate_mount_handle_shape(handle: str) -> str:
     ):
         raise ArtifactValidationError(
             "receipt.mount_handle must not contain URLs or shell syntax"
+        )
+    # A host filesystem path is not an immutable read-only mount handle:
+    # absolute/relative paths (and drive letters) are rejected so a caller
+    # cannot claim '/tmp/not-mounted' or similar as mount evidence.
+    if text.startswith(("/", "\\", ".")) or re.match(r"^[A-Za-z]:", text):
+        raise ArtifactValidationError(
+            "receipt.mount_handle must be a deployment mount handle, not a "
+            "host filesystem path"
         )
     return text
 
@@ -345,22 +620,38 @@ def validate_verifier_identity(verifier: str) -> str:
             "receipt.verifier must be a nonempty deployment verifier "
             "identity/profile"
         )
-    text = verifier.strip()
+    return _validate_identity_text(verifier.strip(), "receipt.verifier")
+
+
+def validate_issuer_identity(issuer: str) -> str:
+    """Validate the trusted-issuer identity claimed by a receipt."""
+    if not isinstance(issuer, str) or not issuer.strip():
+        raise ArtifactValidationError(
+            "receipt.issuer must be a nonempty trusted issuer identity"
+        )
+    return _validate_identity_text(issuer.strip(), "receipt.issuer")
+
+
+def _validate_identity_text(text: str, label: str) -> str:
     lowered = text.lower()
     if (
         "://" in text
         or any(scheme in lowered for scheme in _NETWORK_SCHEMES)
         or any(meta in text for meta in _SHELL_METACHARS)
     ):
-        raise ArtifactValidationError(
-            "receipt.verifier must not contain URLs or shell syntax"
-        )
+        raise ArtifactValidationError(f"{label} must not contain URLs or shell syntax")
     return text
 
 
+def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
+    """Deterministic JSON encoding used for hashes and receipt MACs."""
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
 def canonical_hash(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
 def policy_hash_for(normalized_policy: dict[str, Any]) -> str:
@@ -676,31 +967,47 @@ class V3VerifiedStep(BaseModel):
 
 
 class V3AttachmentReceipt(BaseModel):
-    """Typed deployment attachment receipt (replaces the loose handoff).
+    """Typed, *authenticated* deployment attachment receipt.
 
-    Supplied by the trusted deployment adapter after it verified the staged
-    payload and mounted it read-only. Everything is validated:
+    Syntax is never proof: the gateway accepts a receipt only after an
+    injected :class:`ReceiptVerifier` authenticates it against a trusted
+    deployment issuer (issuer trust store) or resolves its opaque
+    server-side deployment receipt. The authenticated statement binds
+    ``job_id``, ``generation``, ``artifact_digest``, ``staged_ref``, the
+    immutable read-only ``mount_handle``, the ``verifier`` identity/
+    profile, the complete normalized ``plan_hash``, the ordered per-step
+    results, and the issuance/expiry/replay-domain triple.
 
-    - ``artifact_digest`` must equal the manifest ``payload_digest``;
-    - ``staged_ref`` must equal ``staged_payload.ref``;
-    - ``mount_handle`` must be a separate nonempty immutable read-only
-      mount handle and is never derived from the CAS ref;
-    - ``verifier`` is the deployment verifier identity/profile;
-    - ``plan_hash`` must be the canonical hash of the complete normalized
-      manifest ``verify_commands`` plan;
-    - ``steps`` must cover every declared named profile and every legal
-      structured argv step, in plan order, with per-step commitments that
-      only the deployment adapter can compute for the actual plan.
+    Exactly one authentication channel must be present: ``mac`` (issuer
+    MAC over the canonical statement) or ``receipt_ref`` (opaque
+    server-side deployment receipt handle). The gateway never signs
+    receipts and never holds issuer signing secrets.
     """
 
+    issuer: str = Field(min_length=1)
+    job_id: str = Field(min_length=1)
+    generation: int = Field(ge=1)
     artifact_digest: str = Field(min_length=1)
     staged_ref: str = Field(min_length=1)
     mount_handle: str = Field(min_length=1)
     verifier: str = Field(min_length=1)
     plan_hash: str = Field(min_length=1)
     steps: list[V3VerifiedStep] = Field(min_length=1)
+    issued_at: str = Field(min_length=1)
+    expires_at: str = Field(min_length=1)
+    replay_domain: str = Field(min_length=1)
+    mac: str | None = None
+    receipt_ref: str | None = None
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("issuer")
+    @classmethod
+    def _issuer_valid(cls, value: str) -> str:
+        try:
+            return validate_issuer_identity(value)
+        except ArtifactValidationError as error:
+            raise ValueError(str(error)) from error
 
     @field_validator("mount_handle")
     @classmethod
@@ -717,6 +1024,61 @@ class V3AttachmentReceipt(BaseModel):
             return validate_verifier_identity(value)
         except ArtifactValidationError as error:
             raise ValueError(str(error)) from error
+
+    @field_validator("artifact_digest")
+    @classmethod
+    def _digest_is_sha256(cls, value: str) -> str:
+        if not _SHA256_RE.match(value):
+            raise ValueError("receipt.artifact_digest must be a 64-char lowercase hex sha256")
+        return value
+
+    @field_validator("staged_ref")
+    @classmethod
+    def _staged_ref_valid(cls, value: str) -> str:
+        try:
+            return validate_staged_ref(value)
+        except ArtifactValidationError as error:
+            raise ValueError(str(error)) from error
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def _timestamps_valid(cls, value: str) -> str:
+        try:
+            parse_iso_timestamp(value, field_name="receipt timestamp")
+        except ValueError as error:
+            raise ValueError(str(error)) from error
+        return value
+
+    @field_validator("mac")
+    @classmethod
+    def _mac_valid(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _SHA256_RE.match(value):
+            raise ValueError("receipt.mac must be a 64-char lowercase hex MAC")
+        return value
+
+    @field_validator("receipt_ref")
+    @classmethod
+    def _receipt_ref_valid(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _RECEIPT_REF_RE.match(value):
+            raise ValueError(
+                "receipt.receipt_ref must be an opaque server-side receipt "
+                "handle of the form 'receipt:<id>'"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _single_auth_channel(self) -> V3AttachmentReceipt:
+        if (self.mac is None) == (self.receipt_ref is None):
+            raise ValueError(
+                "receipt requires exactly one authentication channel: "
+                "mac (issuer-signed statement) or receipt_ref (opaque "
+                "server-side deployment receipt)"
+            )
+        return self
 
 
 class V3ArtifactConstraints(BaseModel):
@@ -847,6 +1209,44 @@ class ArtifactVerificationError(FoundryError):
         super().__init__(message, code="artifact_verification")
 
 
+class ReceiptVerificationError(FoundryError):
+    """A receipt failed trust-boundary authentication (untrusted evidence).
+
+    Raised when a receipt is not issued by a trusted deployment issuer,
+    its MAC/receipt_ref does not authenticate the claimed statement, or it
+    is expired, over-long-lived, or bound to another attach context. This
+    is untrusted evidence: it quarantines the job like any other
+    verification failure.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, code="receipt_untrusted")
+
+
+class ReceiptConflictError(FoundryError):
+    """A receipt conflicts with the immutable recorded receipt row.
+
+    One receipt row exists per (job, generation, artifact digest). A
+    conflicting receipt is rejected without appending or replacing
+    evidence and quarantines the job under the explicit conflict policy.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, code="receipt_conflict")
+
+
+class VerifierNotConfigured(FoundryError):
+    """No trusted receipt verifier is configured; attach fails closed.
+
+    This is a deployment configuration error, not payload evidence: the
+    job is not quarantined, no evidence is recorded, and the failure is
+    durable under the caller's idempotency key.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, code="verifier_not_configured")
+
+
 class PolicyError(FoundryError, ValueError):
     """A job-bound artifact policy document was invalid.
 
@@ -886,6 +1286,9 @@ class JobNotReady(FoundryError):
 _ERROR_BY_CODE: dict[str, type[FoundryError]] = {
     "artifact_invalid": ArtifactValidationError,
     "artifact_verification": ArtifactVerificationError,
+    "receipt_untrusted": ReceiptVerificationError,
+    "receipt_conflict": ReceiptConflictError,
+    "verifier_not_configured": VerifierNotConfigured,
     "policy_invalid": PolicyError,
     "idempotency_conflict": IdempotencyConflict,
     "stale_generation": StaleGeneration,
@@ -950,8 +1353,10 @@ class FoundryClient(ABC):
 # -- synthetic in-memory client (tests / offline adapter use) --------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class _AttachmentEvidence:
+    """One immutable recorded attachment receipt (never replaced)."""
+
     artifact_digest: str
     manifest: dict[str, Any]
     mount_handle: str
@@ -959,9 +1364,26 @@ class _AttachmentEvidence:
     plan_hash: str
     steps: list[dict[str, Any]]
     staged_ref: str
+    issuer: str
+    issued_at: str
+    expires_at: str
+    replay_domain: str
+    receipt_digest: str
     actor: str
     attached_at: str
     generation: int
+
+
+@dataclass(frozen=True)
+class _ReceiptRecord:
+    """Immutable registry row keyed by (job_id, generation, artifact_digest).
+
+    ``response`` is the original attach response so an exact replay of the
+    identical receipt returns it verbatim instead of re-recording.
+    """
+
+    evidence: _AttachmentEvidence
+    response: dict[str, Any]
 
 
 @dataclass
@@ -1003,17 +1425,27 @@ class InMemoryFoundryClient(FoundryClient):
 
     It never fetches payload bytes, mounts filesystems, or runs
     verification commands: attach requires the deployment-supplied
-    staged-payload reference and verification handoff (both mandatory) and
-    records only that supplied, deployment-confirmed evidence — it never
-    fabricates mount points or verification profiles.
+    staged-payload reference plus an *authenticated* attachment receipt
+    verified by an injected :class:`ReceiptVerifier` (issuer trust store
+    or opaque server-side receipt directory). With no trusted verifier
+    configured, attach fails closed (``verifier_not_configured``). The
+    client records only that authenticated evidence — it never fabricates
+    mount points, verification profiles, or receipts.
     """
 
     jobs: dict[str, _JobRecord] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
     attachments: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     attachment_evidence: dict[str, list[_AttachmentEvidence]] = field(default_factory=dict)
+    # One immutable receipt row per (job_id, generation, artifact_digest).
+    receipt_registry: dict[tuple[str, int, str], _ReceiptRecord] = field(
+        default_factory=dict
+    )
     approvals: list[dict[str, Any]] = field(default_factory=list)
     idempotency: dict[tuple[str, str], tuple[str, dict[str, Any]]] = field(default_factory=dict)
+    # Injected trust boundary: authenticates deployment receipts. None
+    # (production default) fails closed on every attach.
+    receipt_verifier: ReceiptVerifier | None = None
     _seq: int = 0
 
     # -- internals --------------------------------------------------------
@@ -1277,6 +1709,19 @@ class InMemoryFoundryClient(FoundryClient):
             self._idem_store_failure(scope, request.idempotency_key, payload, job, error)
             raise error
 
+        # Trust-boundary precondition, fail closed: with no trusted receipt
+        # verifier configured, every attach is rejected (deployment
+        # configuration error, not payload evidence — no quarantine, no
+        # recorded evidence) until an issuer trust store is injected.
+        verifier = self.receipt_verifier
+        if verifier is None:
+            error = VerifierNotConfigured(
+                "no trusted attachment-receipt verifier is configured; attach "
+                "fails closed until a trusted issuer store is injected"
+            )
+            self._idem_store_failure(scope, request.idempotency_key, payload, job, error)
+            raise error
+
         def quarantine_for_failure(error: FoundryError) -> None:
             self._quarantine(
                 job, actor=request.actor, reason=f"artifact verification failed: {error}",
@@ -1291,11 +1736,12 @@ class InMemoryFoundryClient(FoundryClient):
             quarantine_for_failure(error)
             raise
 
-        # The attachment receipt is mandatory: the gateway records a typed,
-        # deployment-supplied receipt only and never fabricates mount or
-        # verification evidence. Pydantic already rejects a missing receipt
-        # (422); the checks below bind the receipt to the manifest and the
-        # staged payload before anything is recorded.
+        # The attachment receipt is mandatory and *authenticated*: the
+        # gateway records a typed deployment receipt only after an injected
+        # ReceiptVerifier authenticates it (trusted issuer MAC over the
+        # canonical statement, or opaque server-side receipt resolution).
+        # Public hashes alone (plan hash, step commitments, payload digest)
+        # are never proof; Pydantic already rejects a missing receipt (422).
         try:
             staged = request.staged_payload
             receipt = request.receipt
@@ -1313,17 +1759,31 @@ class InMemoryFoundryClient(FoundryClient):
                 raise ArtifactVerificationError(
                     "staged_payload.size does not match the manifest payload_bytes"
                 )
-            if receipt.artifact_digest != manifest["payload_digest"]:
-                raise ArtifactVerificationError(
-                    "receipt.artifact_digest does not equal the manifest payload_digest"
-                )
-            if receipt.staged_ref != staged.ref:
+            # Authenticated trust boundary: verify the receipt against the
+            # trusted issuer store (or the deployment receipt directory) and
+            # require the authenticated statement to bind this exact attach
+            # context — job, generation, artifact digest, and replay domain.
+            binding = ReceiptBinding(
+                job_id=job.job_id,
+                generation=job.generation,
+                artifact_digest=str(manifest["payload_digest"]),
+                replay_domain=attachment_replay_domain(
+                    job.job_id, job.generation, str(manifest["payload_digest"])
+                ),
+            )
+            statement = verifier.verify_receipt(receipt, binding=binding, now=self._now())
+
+            # Bind the authenticated statement to the staged payload, mount,
+            # verifier identity, complete plan hash, and ordered step
+            # results. A validly signed but wrong statement still fails here
+            # and quarantines the job.
+            if statement.get("staged_ref") != staged.ref:
                 raise ArtifactVerificationError(
                     "receipt.staged_ref does not equal the staged_payload ref"
                 )
             try:
                 mount_handle = validate_mount_handle(
-                    receipt.mount_handle, staged_ref=staged.ref
+                    str(statement.get("mount_handle")), staged_ref=staged.ref
                 )
             except ArtifactValidationError as error:
                 # Fabricated mounts are evidence failures (quarantine), not
@@ -1331,32 +1791,35 @@ class InMemoryFoundryClient(FoundryClient):
                 # separate, non-CAS read-only mount.
                 raise ArtifactVerificationError(str(error)) from error
             try:
-                validate_verifier_identity(receipt.verifier)
+                verifier_identity = validate_verifier_identity(
+                    str(statement.get("verifier"))
+                )
             except ArtifactValidationError as error:
                 raise ArtifactVerificationError(str(error)) from error
             plan = manifest["verify_commands"]
-            if receipt.plan_hash != plan_hash_for_plan(plan):
+            if statement.get("plan_hash") != plan_hash_for_plan(plan):
                 raise ArtifactVerificationError(
                     "receipt.plan_hash does not match the canonical hash of the "
                     "normalized manifest verify_commands plan"
                 )
-            if len(receipt.steps) != len(plan):
+            steps = statement.get("steps")
+            if not isinstance(steps, list) or len(steps) != len(plan):
                 raise ArtifactVerificationError(
                     "receipt step evidence does not cover the manifest "
                     "verify_commands plan (missing/partial evidence)"
                 )
-            for i, (rs, ps) in enumerate(zip(receipt.steps, plan, strict=False)):
-                if rs.index != i:
+            for i, (rs, ps) in enumerate(zip(steps, plan, strict=False)):
+                if not isinstance(rs, dict) or rs.get("index") != i:
                     raise ArtifactVerificationError(
                         "receipt step evidence is reordered or has a wrong index"
                     )
                 expected_step = list(ps) if isinstance(ps, (list, tuple)) else ps
-                if rs.step != expected_step:
+                if rs.get("step") != expected_step:
                     raise ArtifactVerificationError(
                         "receipt step evidence does not match the manifest "
                         "verify_commands plan (mismatched step)"
                     )
-                if rs.evidence_digest != step_commitment(i, ps):
+                if rs.get("evidence_digest") != step_commitment(i, ps):
                     raise ArtifactVerificationError(
                         "receipt step evidence is not a valid verified-step "
                         "commitment for this plan step"
@@ -1382,27 +1845,56 @@ class InMemoryFoundryClient(FoundryClient):
 
         digest = str(manifest["payload_digest"])
         now = self._now()
-        if digest not in {str(m.get("payload_digest")) for m in self.attachments[job_id]}:
-            self.attachments[job_id].append(manifest)
-        # Record only deployment-supplied receipt evidence: the mount handle,
-        # verifier identity, plan hash, and verified-step commitments are the
-        # deployment adapter's typed receipt values. Nothing is synthesized.
+        # One immutable receipt row per (job, generation, artifact digest):
+        # exact replay of the identical receipt returns the original
+        # response; any conflicting receipt is rejected without appending
+        # or replacing evidence and quarantines the job under the explicit
+        # conflict policy.
+        receipt_digest = canonical_hash(receipt.model_dump())
+        row_key = (job_id, job.generation, digest)
+        existing = self.receipt_registry.get(row_key)
+        if existing is not None:
+            if existing.evidence.receipt_digest == receipt_digest:
+                original = dict(existing.response)
+                self._idem_store(scope, request.idempotency_key, payload, original)
+                return V3WriteResponse(**{**original, "replayed": True})
+            error = ReceiptConflictError(
+                f"conflicting attachment receipt for job {job.job_id} generation "
+                f"{job.generation} artifact digest {digest[:12]}; the recorded "
+                "receipt is immutable"
+            )
+            quarantine_for_failure(error)
+            raise error
+
+        # Record only authenticated receipt evidence: the mount handle,
+        # verifier identity, plan hash, and ordered step results come from
+        # the verified statement. Nothing is synthesized.
         evidence = _AttachmentEvidence(
             artifact_digest=digest,
             manifest=dict(manifest),
             mount_handle=mount_handle,
-            verifier=receipt.verifier,
-            plan_hash=receipt.plan_hash,
-            steps=[s.model_dump() for s in receipt.steps],
-            staged_ref=staged.ref,
+            verifier=verifier_identity,
+            plan_hash=str(statement["plan_hash"]),
+            steps=[dict(s) for s in statement["steps"]],
+            staged_ref=str(statement["staged_ref"]),
+            issuer=str(statement["issuer"]),
+            issued_at=str(statement["issued_at"]),
+            expires_at=str(statement["expires_at"]),
+            replay_domain=str(statement["replay_domain"]),
+            receipt_digest=receipt_digest,
             actor=request.actor,
             attached_at=now,
             generation=job.generation,
         )
+        response = self._response("attach", job, canonical_hash(payload))
+        self.receipt_registry[row_key] = _ReceiptRecord(
+            evidence=evidence, response=response.model_dump()
+        )
         self.attachment_evidence[job_id].append(evidence)
+        if digest not in {str(m.get("payload_digest")) for m in self.attachments[job_id]}:
+            self.attachments[job_id].append(manifest)
         self._record(job, from_state=job.state, to_state=job.state, actor=request.actor,
                      reason=f"artifact attached {digest[:12]}")
-        response = self._response("attach", job, canonical_hash(payload))
         self._idem_store(scope, request.idempotency_key, payload, response.model_dump())
         return response
 
@@ -1683,6 +2175,11 @@ class InMemoryFoundryClient(FoundryClient):
                                 dict(s) for s in evidence.steps
                             ],
                             "staged_ref": evidence.staged_ref,
+                            "issuer": evidence.issuer,
+                            "issued_at": evidence.issued_at,
+                            "expires_at": evidence.expires_at,
+                            "replay_domain": evidence.replay_domain,
+                            "receipt_digest": evidence.receipt_digest,
                             "actor": evidence.actor,
                             "attached_at": evidence.attached_at,
                             "generation": evidence.generation,
